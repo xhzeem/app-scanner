@@ -4,7 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log"
+	"log/slog"
 	"strings"
 
 	"github.com/SiriusScan/app-scanner/modules/naabu"
@@ -36,7 +36,7 @@ func (n *NmapStrategy) Execute(target string) (sirius.Host, error) {
 
 // ExecuteWithContext performs the vulnerability scan with cancellation support.
 func (n *NmapStrategy) ExecuteWithContext(ctx context.Context, target string) (sirius.Host, error) {
-	log.Printf("Starting vulnerability scan on target: %s", target)
+	slog.Info("starting vulnerability scan", "target", target)
 
 	// Check for cancellation before starting
 	if ctx.Err() != nil {
@@ -53,19 +53,19 @@ func (n *NmapStrategy) ExecuteWithContext(ctx context.Context, target string) (s
 	// Use explicit script list if provided, otherwise fall back to protocols
 	if len(n.ScriptList) > 0 {
 		config.ScriptList = n.ScriptList
-		log.Printf("Using explicit script list with %d scripts", len(n.ScriptList))
+		slog.Debug("using explicit script list", "script_count", len(n.ScriptList))
 	} else if len(n.Protocols) > 0 {
 		config.Protocols = n.Protocols
-		log.Printf("Using protocol-based script selection: %v", n.Protocols)
+		slog.Debug("using protocol-based script selection", "protocols", n.Protocols)
 	} else {
 		// Default to all protocols
 		config.Protocols = []string{"*"}
-		log.Printf("Using default wildcard scan")
+		slog.Debug("using default wildcard scan")
 	}
 
 	// Log port range being used
 	if n.PortRange != "" {
-		log.Printf("Using template port range: %s", n.PortRange)
+		slog.Debug("using template port range", "port_range", n.PortRange)
 	}
 
 	results, err := nmap.ScanWithConfig(config)
@@ -86,7 +86,7 @@ func (n *NmapStrategy) ExecuteWithContext(ctx context.Context, target string) (s
 	}
 	results.Vulnerabilities = expandedVulns
 
-	log.Printf("Final vulnerability count for %s: %d", target, len(results.Vulnerabilities))
+	slog.Info("vulnerability scan complete", "target", target, "vuln_count", len(results.Vulnerabilities))
 	return results, nil
 }
 
@@ -110,7 +110,7 @@ func expandVulnerability(vuln sirius.Vulnerability) sirius.Vulnerability {
 	cveDetails, err := nvd.GetCVE(trimmed)
 	if err != nil {
 		// Log error but continue with basic vuln info
-		log.Printf("Error getting CVE details for %s: %v", trimmed, err)
+		slog.Error("failed to get CVE details", "cve", trimmed, "error", err)
 
 		// Set minimal details for the vulnerability
 		vuln.Description = fmt.Sprintf("No description available for %s. Detected during scan.", trimmed)
@@ -184,7 +184,7 @@ func (n *NaabuStrategy) ExecuteWithContext(ctx context.Context, target string) (
 		Ctx:       ctx, // Pass context for cancellation
 	})
 	if errors.Is(err, naabu.ErrHostDown) {
-		log.Printf("Host %s appears down (no open ports found by NAABU), skipping further scans.", target)
+		slog.Info("host appears down, skipping further scans", "target", target)
 		return sirius.Host{}, nil
 	}
 	if err != nil {

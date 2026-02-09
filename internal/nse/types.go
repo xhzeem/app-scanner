@@ -8,8 +8,12 @@ import (
 )
 
 const (
-	// NSERepoURL is the Git repository URL for Sirius NSE scripts
-	NSERepoURL = "https://github.com/SiriusScan/sirius-nse.git"
+	// DefaultNSERepoURL is the default Git repository URL for Sirius NSE scripts.
+	// Override with the NSE_REPO_URL environment variable.
+	DefaultNSERepoURL = "https://github.com/SiriusScan/sirius-nse.git"
+	// DefaultNSEBasePath is the default base path where NSE scripts are stored.
+	// Override with the NSE_BASE_PATH environment variable.
+	DefaultNSEBasePath = "/opt/sirius-nse"
 	// ManifestFile is the name of the manifest file
 	ManifestFile = "manifest.json"
 	// ValKeyManifestKey is the key used to store the manifest in ValKey
@@ -22,8 +26,19 @@ const (
 	ValKeyScriptMetaPrefix = "nse:meta:"
 )
 
-// NSEBasePath is the base path where NSE scripts are stored
-var NSEBasePath = "/opt/sirius-nse"
+// NSERepoURL returns the NSE repository URL from env or the default.
+var NSERepoURL = envOrDefault("NSE_REPO_URL", DefaultNSERepoURL)
+
+// NSEBasePath is the base path where NSE scripts are stored.
+var NSEBasePath = envOrDefault("NSE_BASE_PATH", DefaultNSEBasePath)
+
+// envOrDefault returns the environment variable value or the provided default.
+func envOrDefault(key, fallback string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return fallback
+}
 
 // Repository represents a single NSE script repository
 type Repository struct {

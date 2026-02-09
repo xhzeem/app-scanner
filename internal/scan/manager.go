@@ -6,7 +6,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
-	"log"
+	"log/slog"
 	"net"
 	"net/http"
 	"os"
@@ -106,7 +106,7 @@ func NewScanManager(kvStore store.KVStore, toolFactory *ScanToolFactory, updater
 	ctx, cancel := context.WithCancel(context.Background())
 
 	// Initialize NSE repository manager
-	repoManager := nse.NewRepoManager("/sirius-nse", nse.NSERepoURL)
+	repoManager := nse.NewRepoManager(nse.NSEBasePath, nse.NSERepoURL)
 
 	// Initialize NSE sync manager
 	syncManager := nse.NewSyncManager(repoManager, kvStore)
@@ -118,9 +118,9 @@ func NewScanManager(kvStore store.KVStore, toolFactory *ScanToolFactory, updater
 	apiBaseURL := os.Getenv("SIRIUS_API_URL")
 	if apiBaseURL == "" {
 		apiBaseURL = "http://localhost:9001" // Default for development
-		log.Printf("⚠️  SIRIUS_API_URL not set, using default: %s", apiBaseURL)
+		slog.Info("SIRIUS_API_URL not set, using default", "api_base_url", apiBaseURL)
 	} else {
-		log.Printf("✅ Using SIRIUS_API_URL from environment: %s", apiBaseURL)
+		slog.Info("Using SIRIUS_API_URL from environment", "api_base_url", apiBaseURL)
 	}
 
 	sm := &ScanManager{
@@ -156,25 +156,25 @@ func (sm *ScanManager) detectScannerVersion(toolName string) string {
 				if len(parts) >= 3 {
 					version := parts[2]
 					// Log version detection for audit purposes
-					log.Printf("Detected nmap version: %s", version)
+					slog.Debug("Detected nmap version", "version", version)
 					return version
 				}
 			}
 		} else {
-			log.Printf("Warning: Failed to detect nmap version: %v", err)
+			slog.Warn("Failed to detect nmap version", "error", err)
 		}
 		return "unknown"
 	case "naabu":
 		if output, err := exec.Command("naabu", "-version").Output(); err == nil {
 			version := strings.TrimSpace(string(output))
-			log.Printf("Detected naabu version: %s", version)
+			slog.Debug("Detected naabu version", "version", version)
 			return version
 		} else {
-			log.Printf("Warning: Failed to detect naabu version: %v", err)
+			slog.Warn("Failed to detect naabu version", "error", err)
 		}
 		return "unknown"
 	default:
-		log.Printf("Warning: Unknown tool name for version detection: %s", toolName)
+		slog.Warn("Unknown tool name for version detection", "tool_name", toolName)
 		return "unknown"
 	}
 }
@@ -255,7 +255,7 @@ func (sm *ScanManager) createScanSource(toolName string) models.ScanSource {
 	}
 
 	// Log source creation for debugging
-	log.Printf("Created scan source: %s v%s with config: %s", source.Name, source.Version, source.Config)
+	slog.Info("Created scan source", "name", source.Name, "version", source.Version, "config", source.Config)
 
 	return source
 }
@@ -271,13 +271,13 @@ func (sm *ScanManager) submitHostWithSource(host sirius.Host, toolName string) e
 
 	jsonData, err := json.Marshal(request)
 	if err != nil {
-		return fmt.Errorf("failed to marshal request: %v", err)
+		return fmt.Errorf("failed to marshal request: %w", err)
 	}
 
 	url := fmt.Sprintf("%s/host/with-source", sm.apiBaseURL)
 	resp, err := http.Post(url, "application/json", bytes.NewBuffer(jsonData))
 	if err != nil {
-		return fmt.Errorf("failed to submit host data: %v", err)
+		return fmt.Errorf("failed to submit host data: %w", err)
 	}
 	defer resp.Body.Close()
 
@@ -285,7 +285,7 @@ func (sm *ScanManager) submitHostWithSource(host sirius.Host, toolName string) e
 		return fmt.Errorf("API returned status %d", resp.StatusCode)
 	}
 
-	log.Printf("Successfully submitted host %s with source %s (version %s)", host.IP, source.Name, source.Version)
+	slog.Debug("Successfully submitted host with source", "host_ip", host.IP, "source_name", source.Name, "source_version", source.Version)
 	return nil
 }
 
@@ -311,25 +311,28 @@ func (sm *ScanManager) submitFingerprintResult(ip string, result FingerprintResu
 }
 
 // ListenForScans attaches the ScanManager to the "scan" queue.
+// Uses ListenWithRetry for resilient connection handling — if RabbitMQ is
+// unavailable at startup or drops the connection later, the listener will
+// automatically reconnect with exponential backoff instead of crashing.
 func (sm *ScanManager) ListenForScans() {
 	// Sync NSE scripts before starting to listen for scans
 	if err := sm.nseSync.Sync(sm.ctx); err != nil {
-		log.Printf("Warning: failed to sync NSE scripts: %v", err)
+		slog.Warn("Failed to sync NSE scripts", "error", err)
 	}
 
 	// Initialize system templates
 	if err := sm.templateManager.InitializeSystemTemplates(sm.ctx); err != nil {
-		log.Printf("Warning: failed to initialize system templates: %v", err)
+		slog.Warn("Failed to initialize system templates", "error", err)
 	}
 
-	queue.Listen("scan", sm.handleMessage)
+	queue.ListenWithRetry(sm.ctx, "scan", sm.handleMessage)
 }
 
 // handleMessage processes incoming scan requests
 func (sm *ScanManager) handleMessage(msg string) {
 	var scanMsg ScanMessage
 	if err := json.Unmarshal([]byte(msg), &scanMsg); err != nil {
-		log.Printf("Invalid scan message: %v", err)
+		slog.Error("Invalid scan message", "error", err)
 		sm.logger.LogScanError("unknown", "unknown", "message_parse_error", "Failed to parse scan message", err)
 		return
 	}
@@ -353,7 +356,7 @@ func (sm *ScanManager) handleMessage(msg string) {
 	if scanMsg.Options.TemplateID != "" {
 		template, err := sm.templateManager.GetTemplate(sm.ctx, scanMsg.Options.TemplateID)
 		if err != nil {
-			log.Printf("Failed to get template '%s': %v", scanMsg.Options.TemplateID, err)
+			slog.Error("Failed to get template", "template_id", scanMsg.Options.TemplateID, "error", err)
 			sm.logger.LogScanError(scanMsg.ID, "template_resolution", "template_not_found", "Failed to resolve template", err)
 			return
 		}
@@ -378,12 +381,12 @@ func (sm *ScanManager) handleMessage(msg string) {
 			scanMsg.Options.Parallel = template.ScanOptions.Parallel
 		}
 
-		log.Printf("Resolved template '%s': %s", template.ID, template.Name)
+		slog.Info("Resolved template", "template_id", template.ID, "template_name", template.Name)
 	}
 
 	// Continue with validation and processing
 	if err := sm.validateScanMessage(&scanMsg); err != nil {
-		log.Printf("Invalid scan configuration: %v", err)
+		slog.Error("Invalid scan configuration", "error", err)
 		sm.logger.LogScanError(scanMsg.ID, "validation", "scan_validation_error", "Invalid scan configuration", err)
 		return
 	}
@@ -412,7 +415,7 @@ func (sm *ScanManager) validateScanMessage(msg *ScanMessage) error {
 
 // processTarget runs the discovery scan followed by a vulnerability scan
 func (sm *ScanManager) processTarget(target Target) {
-	log.Printf("Processing target: Type=%s, Value=%s, Timeout=%d", target.Type, target.Value, target.Timeout)
+	slog.Debug("Processing target", "type", target.Type, "value", target.Value, "timeout", target.Timeout)
 
 	// Log target processing start
 	sm.logger.LogScanEvent(sm.currentScanID, "target_processing", "Target processing started", map[string]interface{}{
@@ -424,7 +427,7 @@ func (sm *ScanManager) processTarget(target Target) {
 	// Convert target to appropriate format based on type
 	targetIPs, err := sm.prepareTarget(target)
 	if err != nil {
-		log.Printf("Failed to prepare target %s: %v", target.Value, err)
+		slog.Error("Failed to prepare target", "target_value", target.Value, "error", err)
 		sm.logger.LogScanError(sm.currentScanID, target.Value, "target_preparation_error", "Failed to prepare target", err)
 		return
 	}
@@ -438,7 +441,7 @@ func (sm *ScanManager) processTarget(target Target) {
 	})
 
 	// Add each IP as a task to the worker pool
-	log.Printf("Adding %d IPs to worker pool (scan types: %v, port range: %s)", len(targetIPs), sm.currentScanOptions.ScanTypes, sm.currentScanOptions.PortRange)
+	slog.Debug("Adding IPs to worker pool", "count", len(targetIPs), "scan_types", sm.currentScanOptions.ScanTypes, "port_range", sm.currentScanOptions.PortRange)
 
 	// Log scan started event (new event system)
 	sm.logger.LogScanStarted(sm.currentScanID, targetIPs, map[string]interface{}{
@@ -461,43 +464,42 @@ func (sm *ScanManager) processTarget(target Target) {
 func (sm *ScanManager) scanIP(ctx context.Context, ip string) {
 	// Check for cancellation before starting
 	if ctx.Err() != nil {
-		log.Printf("[SCAN] Cancelled before scanning %s", ip)
+		slog.Debug("Cancelled before scanning", "ip", ip)
 		return
 	}
 
 	// Validate if this is a single IP before proceeding
 	if net.ParseIP(ip) == nil {
-		log.Printf("Warning: Expected single IP, got: %s", ip)
+		slog.Warn("Expected single IP", "got", ip)
 		return
 	}
 
-	log.Printf("🚀 Starting scan pipeline for %s (types: %v, template ports: %s)",
-		ip, sm.currentScanOptions.ScanTypes, sm.currentScanOptions.PortRange)
+	slog.Debug("Starting scan pipeline", "ip", ip, "types", sm.currentScanOptions.ScanTypes, "template_ports", sm.currentScanOptions.PortRange)
 
 	// PHASE 0: Fingerprinting (ping++ - host liveness and OS detection)
 	// Uses ping++ for ICMP/TCP probing and TTL-based OS detection.
 	// Discovered hosts are immediately submitted to the API for real-time visibility.
 	if contains(sm.currentScanOptions.ScanTypes, "fingerprint") {
-		log.Printf("📍 Phase 0: Fingerprinting scan on %s", ip)
+		slog.Debug("Phase 0: Fingerprinting scan", "ip", ip)
 		startTime := time.Now()
 		fingerprintStrategy := sm.toolFactory.CreateFingerprintTool()
 		result, err := fingerprintStrategy.Fingerprint(ip)
 		duration := time.Since(startTime)
 
 		if err != nil {
-			log.Printf("Fingerprinting failed for %s: %v", ip, err)
+			slog.Error("Fingerprinting failed", "ip", ip, "error", err)
 			sm.logger.LogToolExecution(sm.currentScanID, ip, "ping++", duration, false, map[string]interface{}{
 				"error": err.Error(),
 			})
 		} else if !result.IsAlive {
-			log.Printf("⚠️  Host %s appears to be down, skipping further scans", ip)
+			slog.Warn("Host appears to be down, skipping further scans", "ip", ip)
 			sm.logger.LogToolExecution(sm.currentScanID, ip, "ping++", duration, true, map[string]interface{}{
 				"is_alive": false,
 			})
-			log.Printf("Scan completed for %s (host down)", ip)
+			slog.Debug("Scan completed for host down", "ip", ip)
 			return
 		} else {
-			log.Printf("✅ Fingerprint: host=%s alive=%t os=%s ttl=%d", ip, result.IsAlive, result.OSFamily, result.TTL)
+			slog.Debug("Fingerprint result", "host", ip, "alive", result.IsAlive, "os", result.OSFamily, "ttl", result.TTL)
 
 			// Log tool execution success
 			sm.logger.LogToolExecution(sm.currentScanID, ip, "ping++", duration, true, map[string]interface{}{
@@ -508,17 +510,18 @@ func (sm *ScanManager) scanIP(ctx context.Context, ip string) {
 
 			// Submit discovered host to API for real-time visibility
 			if err := sm.submitFingerprintResult(ip, result); err != nil {
-				log.Printf("Warning: failed to submit fingerprint data via API: %v", err)
+				slog.Warn("Failed to submit fingerprint data via API", "error", err)
 				// Continue execution even if API submission fails
 			} else {
-				log.Printf("Successfully submitted fingerprint discovery for %s", ip)
+				slog.Debug("Successfully submitted fingerprint discovery", "ip", ip)
 			}
 
 			// Update KV store with discovered host
 			hostWasNew := false
 			if err := sm.scanUpdater.Update(context.Background(), func(scan *store.ScanResult) error {
-				if !contains(scan.Hosts, ip) {
-					scan.Hosts = append(scan.Hosts, ip)
+				var isNew bool
+				scan.Hosts, isNew = mergeHost(scan.Hosts, ip, "", "network")
+				if isNew {
 					hostWasNew = true
 				}
 				if scan.StartTime == "" {
@@ -526,19 +529,19 @@ func (sm *ScanManager) scanIP(ctx context.Context, ip string) {
 				}
 				return nil
 			}); err != nil {
-				log.Printf("Warning: failed to update KV store with fingerprint discovery: %v", err)
+				slog.Warn("Failed to update KV store with fingerprint discovery", "error", err)
 			}
 
 			// Log host discovered event
 			if hostWasNew {
 				sm.logger.LogHostDiscovered(ip, sm.currentScanID, map[string]interface{}{
-					"os_family":   result.OSFamily,
-					"ttl":         result.TTL,
-					"discovery":   "fingerprint",
-					"tool":        "ping++",
-					"is_alive":    result.IsAlive,
-					"confidence":  result.Details["confidence"],
-					"hops":        result.Details["hops"],
+					"os_family":  result.OSFamily,
+					"ttl":        result.TTL,
+					"discovery":  "fingerprint",
+					"tool":       "ping++",
+					"is_alive":   result.IsAlive,
+					"confidence": result.Details["confidence"],
+					"hops":       result.Details["hops"],
 				})
 			}
 		}
@@ -546,7 +549,7 @@ func (sm *ScanManager) scanIP(ctx context.Context, ip string) {
 
 	// Check for cancellation after fingerprint phase
 	if ctx.Err() != nil {
-		log.Printf("[SCAN] Cancelled after fingerprint phase for %s", ip)
+		slog.Debug("Cancelled after fingerprint phase", "ip", ip)
 		return
 	}
 
@@ -555,60 +558,66 @@ func (sm *ScanManager) scanIP(ctx context.Context, ip string) {
 	// PHASE 1: Port Enumeration (Naabu - fast, accurate port discovery)
 	// Supports both "enumeration" and "port_scan" scan types for backward compatibility
 	if contains(sm.currentScanOptions.ScanTypes, "enumeration") || contains(sm.currentScanOptions.ScanTypes, "port_scan") {
-		log.Printf("🔍 Phase 1: Port enumeration scan on %s", ip)
+		slog.Debug("Phase 1: Port enumeration scan", "ip", ip)
 		ports, err := sm.runEnumeration(ctx, ip)
 		if err != nil {
-			log.Printf("Enumeration failed for %s: %v", ip, err)
+			slog.Error("Enumeration failed", "ip", ip, "error", err)
 		} else if len(ports) > 0 {
 			discoveredPorts = ports
-			log.Printf("✅ Enumeration found %d ports on %s: %v", len(ports), ip, ports)
+			slog.Debug("Enumeration found ports", "ip", ip, "count", len(ports), "ports", ports)
 		} else {
-			log.Printf("⚠️  Enumeration found no open ports on %s", ip)
+			slog.Warn("Enumeration found no open ports", "ip", ip)
 		}
 	}
 
 	// Check for cancellation after enumeration phase
 	if ctx.Err() != nil {
-		log.Printf("[SCAN] Cancelled after enumeration phase for %s", ip)
+		slog.Debug("Cancelled after enumeration phase", "ip", ip)
 		return
 	}
 
 	// PHASE 2: Vulnerability Scanning (Nmap - uses discovered ports ONLY)
 	if contains(sm.currentScanOptions.ScanTypes, "vulnerability") {
-		log.Printf("🎯 Phase 2: Vulnerability scan on %s", ip)
+		slog.Debug("Phase 2: Vulnerability scan", "ip", ip)
 
 		// Determine which ports to scan
 		var portList string
 		if len(discoveredPorts) > 0 {
 			// Use discovered ports from discovery/enumeration
 			portList = portsToString(discoveredPorts)
-			log.Printf("🎯 Using %d discovered ports: %s", len(discoveredPorts), portList)
+			slog.Debug("Using discovered ports", "ip", ip, "count", len(discoveredPorts), "port_list", portList)
 		} else if sm.currentScanOptions.PortRange != "" {
 			// Fallback to template port range if no ports discovered
 			portList = sm.currentScanOptions.PortRange
-			log.Printf("⚠️  No ports discovered, falling back to template port_range: %s", portList)
+			slog.Warn("No ports discovered, falling back to template port_range", "port_list", portList)
 		} else {
 			// No ports discovered and no template range - skip
-			log.Printf("⚠️  No ports discovered and no port_range specified - skipping vulnerability scan for %s", ip)
-			log.Printf("Scan completed for %s", ip)
+			slog.Warn("No ports discovered and no port_range specified, skipping vulnerability scan", "ip", ip)
+			slog.Debug("Scan completed", "ip", ip)
 			return
 		}
 
 		// Run vulnerability scan with specific ports
 		if err := sm.runVulnerabilityWithPorts(ctx, ip, portList); err != nil {
-			log.Printf("Vulnerability scan failed for %s: %v", ip, err)
+			slog.Error("Vulnerability scan failed", "ip", ip, "error", err)
 		} else {
-			log.Printf("✅ Vulnerability scan completed for %s", ip)
+			slog.Debug("Vulnerability scan completed", "ip", ip)
 		}
 	}
 
-	log.Printf("✅ Scan pipeline completed for %s", ip)
+	slog.Debug("Scan pipeline completed", "ip", ip)
 }
 
 // markHostComplete updates the scan status for a completed host
 func (sm *ScanManager) markHostComplete(ip string) error {
 	return sm.scanUpdater.Update(context.Background(), func(scan *store.ScanResult) error {
 		scan.HostsCompleted++
+
+		// Update network sub-scan progress
+		if netScan, ok := scan.SubScans["network"]; ok {
+			netScan.Progress.Completed = scan.HostsCompleted
+			scan.SubScans["network"] = netScan
+		}
 
 		// Log host completion
 		sm.logger.LogScanEvent(sm.currentScanID, "host_completed", "Host scan completed", map[string]interface{}{
@@ -617,10 +626,25 @@ func (sm *ScanManager) markHostComplete(ip string) error {
 			"total_hosts":     len(scan.Hosts),
 		})
 
-		// If all hosts are processed, mark scan as complete
-		if scan.HostsCompleted >= len(scan.Hosts) {
-			scan.Status = "completed"
-			scan.EndTime = time.Now().Format(time.RFC3339)
+		// Count network-sourced hosts for completion check
+		networkHostCount := 0
+		for _, h := range scan.Hosts {
+			for _, src := range h.Sources {
+				if src == "network" {
+					networkHostCount++
+					break
+				}
+			}
+		}
+
+		// If all network hosts are processed, mark network sub-scan as complete
+		if scan.HostsCompleted >= networkHostCount && networkHostCount > 0 {
+			if netScan, ok := scan.SubScans["network"]; ok {
+				netScan.Status = "completed"
+				netScan.Progress.Total = networkHostCount
+				netScan.Progress.Completed = networkHostCount
+				scan.SubScans["network"] = netScan
+			}
 
 			// Log scan completion (new event system)
 			sm.logger.LogScanCompleted(sm.currentScanID, map[string]interface{}{
@@ -629,6 +653,19 @@ func (sm *ScanManager) markHostComplete(ip string) error {
 				"vulnerabilities_found": len(scan.Vulnerabilities),
 				"total_hosts":           len(scan.Hosts),
 			})
+
+			// Only mark overall scan as completed if ALL sub-scans are done
+			allDone := true
+			for _, ss := range scan.SubScans {
+				if ss.Enabled && ss.Status != "completed" && ss.Status != "failed" {
+					allDone = false
+					break
+				}
+			}
+			if allDone {
+				scan.Status = "completed"
+				scan.EndTime = time.Now().Format(time.RFC3339)
+			}
 		}
 		return nil
 	})
@@ -645,7 +682,7 @@ func (sm *ScanManager) runEnumeration(ctx context.Context, ip string) ([]int, er
 		sm.logger.LogToolExecution(sm.currentScanID, ip, "naabu", duration, false, map[string]interface{}{
 			"error": err.Error(),
 		})
-		return nil, fmt.Errorf("port enumeration failed for %s: %v", ip, err)
+		return nil, fmt.Errorf("port enumeration failed for %s: %w", ip, err)
 	}
 
 	// Extract enumerated ports
@@ -667,40 +704,42 @@ func (sm *ScanManager) runEnumeration(ctx context.Context, ip string) ([]int, er
 
 		// Submit host data using the new source-aware API
 		if err := sm.submitHostWithSource(enumResults, toolName); err != nil {
-			log.Printf("Warning: failed to submit enumeration data via source-aware API: %v", err)
-			log.Printf("This may indicate the API is not available or the endpoint is not implemented")
-			log.Printf("Will continue scan without database persistence")
+			slog.Warn("Failed to submit enumeration data via source-aware API", "error", err)
+			slog.Debug("API may be unavailable or endpoint not implemented; continuing without database persistence")
 			// Continue execution even if database operations fail
 		} else {
-			log.Printf("Successfully added host %s with enumeration data using source-aware API", enumResults.IP)
+			slog.Debug("Successfully added host with enumeration data using source-aware API", "ip", enumResults.IP)
 		}
 	}
 
 	// Update KV store with enumeration details but preserve existing data
+	// Guard: only add host if enumResults.IP is non-empty (naabu returns empty Host{} when host is down)
 	hostWasNew := false
-	if err := sm.scanUpdater.Update(context.Background(), func(scan *store.ScanResult) error {
-		if !contains(scan.Hosts, enumResults.IP) {
-			scan.Hosts = append(scan.Hosts, enumResults.IP)
-			hostWasNew = true
+	if enumResults.IP != "" {
+		if err := sm.scanUpdater.Update(context.Background(), func(scan *store.ScanResult) error {
+			var isNew bool
+			scan.Hosts, isNew = mergeHost(scan.Hosts, enumResults.IP, "", "network")
+			if isNew {
+				hostWasNew = true
+			}
+			if scan.StartTime == "" {
+				scan.StartTime = time.Now().Format(time.RFC3339)
+			}
+			return nil
+		}); err != nil {
+			return nil, fmt.Errorf("failed to update scan with enumeration results for host %s: %w", ip, err)
 		}
-		if scan.StartTime == "" {
-			scan.StartTime = time.Now().Format(time.RFC3339)
+
+		// Log host discovered event (new event system)
+		if hostWasNew {
+			sm.logger.LogHostDiscovered(enumResults.IP, sm.currentScanID, map[string]interface{}{
+				"ports_found": len(enumeratedPorts),
+				"os":          enumResults.OS,
+			})
 		}
-		return nil
-	}); err != nil {
-		return nil, fmt.Errorf("failed to update scan with enumeration results for host %s: %v", ip, err)
 	}
 
-	// Log host discovered event (new event system)
-	if hostWasNew {
-		sm.logger.LogHostDiscovered(enumResults.IP, sm.currentScanID, map[string]interface{}{
-			"ports_found": len(enumeratedPorts),
-			"os":          enumResults.OS,
-		})
-	}
-
-	log.Printf("Enumeration results: IP=%s, Hostname=%s, Ports=%d, Services=%d, OS=%s",
-		enumResults.IP, enumResults.Hostname, len(enumResults.Ports), len(enumResults.Services), enumResults.OS)
+	slog.Debug("Enumeration results", "ip", enumResults.IP, "hostname", enumResults.Hostname, "ports", len(enumResults.Ports), "services", len(enumResults.Services), "os", enumResults.OS)
 	return enumeratedPorts, nil // Return enumerated ports for pipeline
 }
 
@@ -726,7 +765,7 @@ func (sm *ScanManager) runVulnerabilityWithPorts(ctx context.Context, ip string,
 	originalPortRange := sm.currentScanOptions.PortRange
 	if portList != "" {
 		sm.currentScanOptions.PortRange = portList
-		log.Printf("🎯 Overriding port range for %s: %s → %s", ip, originalPortRange, portList)
+		slog.Debug("Overriding port range", "ip", ip, "original", originalPortRange, "port_list", portList)
 	}
 	// Restore original port range when done
 	defer func() {
@@ -740,10 +779,10 @@ func (sm *ScanManager) runVulnerabilityWithPorts(ctx context.Context, ip string,
 	if sm.currentScanOptions.TemplateID != "" {
 		scripts, err := sm.templateManager.ResolveScripts(sm.ctx, sm.currentScanOptions.TemplateID)
 		if err != nil {
-			log.Printf("Warning: failed to resolve scripts from template: %v", err)
+			slog.Warn("Failed to resolve scripts from template", "error", err)
 		} else {
 			scriptList = scripts
-			log.Printf("Resolved %d scripts from template '%s'", len(scriptList), sm.currentScanOptions.TemplateID)
+			slog.Info("Resolved scripts from template", "count", len(scriptList), "template_id", sm.currentScanOptions.TemplateID)
 		}
 	}
 
@@ -758,7 +797,7 @@ func (sm *ScanManager) runVulnerabilityWithPorts(ctx context.Context, ip string,
 		}
 		// CRITICAL: Update the port range from currentScanOptions (which may have been overridden)
 		nmapStrat.PortRange = sm.currentScanOptions.PortRange
-		log.Printf("Configured Nmap strategy with %d scripts and port range: %s", len(scriptList), nmapStrat.PortRange)
+		slog.Debug("Configured Nmap strategy", "script_count", len(scriptList), "port_range", nmapStrat.PortRange)
 	}
 
 	vulnResults, err := vulnStrategy.ExecuteWithContext(ctx, ip)
@@ -768,10 +807,10 @@ func (sm *ScanManager) runVulnerabilityWithPorts(ctx context.Context, ip string,
 		sm.logger.LogToolExecution(sm.currentScanID, ip, "nmap", duration, false, map[string]interface{}{
 			"error": err.Error(),
 		})
-		return fmt.Errorf("vulnerability scan failed for %s: %v", ip, err)
+		return fmt.Errorf("vulnerability scan failed for %s: %w", ip, err)
 	}
 
-	log.Printf("Found %d vulnerabilities for host %s", len(vulnResults.Vulnerabilities), ip)
+	slog.Debug("Found vulnerabilities for host", "ip", ip, "count", len(vulnResults.Vulnerabilities))
 
 	// Log tool execution success
 	sm.logger.LogToolExecution(sm.currentScanID, ip, "nmap", duration, true, map[string]interface{}{
@@ -795,9 +834,9 @@ func (sm *ScanManager) runVulnerabilityWithPorts(ctx context.Context, ip string,
 
 	// Submit host data using the new source-aware API
 	if err := sm.submitHostWithSource(vulnResults, toolName); err != nil {
-		log.Printf("Warning: failed to submit host data via source-aware API: %v", err)
-		log.Printf("This may indicate the API is not available or the endpoint is not implemented")
-		return fmt.Errorf("failed to submit host data with source attribution: %v", err)
+		slog.Error("Failed to submit host data via source-aware API", "error", err)
+		slog.Debug("API may be unavailable or endpoint not implemented")
+		return fmt.Errorf("failed to submit host data with source attribution: %w", err)
 	}
 
 	// Update KV store with vulnerability details
@@ -809,19 +848,22 @@ func (sm *ScanManager) runVulnerabilityWithPorts(ctx context.Context, ip string,
 				Severity:    severity,
 				Title:       vuln.Title,
 				Description: vuln.Description,
+				RiskScore:   vuln.RiskScore,
+				ScanSource:  "network",
+				HostID:      vulnResults.IP,
 			})
 		}
 		return nil
 	}); err != nil {
-		return fmt.Errorf("failed to update scan with vulnerabilities for host %s: %v", vulnResults.IP, err)
+		return fmt.Errorf("failed to update scan with vulnerabilities for host %s: %w", vulnResults.IP, err)
 	}
 
 	// Only mark host complete after vulnerability scan
 	if err := sm.markHostComplete(ip); err != nil {
-		return fmt.Errorf("failed to mark host completion: %v", err)
+		return fmt.Errorf("failed to mark host completion: %w", err)
 	}
 
-	log.Printf("Successfully processed host %s with %d vulnerabilities using source-aware API", ip, len(vulnResults.Vulnerabilities))
+	slog.Debug("Successfully processed host with vulnerabilities using source-aware API", "ip", ip, "vulnerability_count", len(vulnResults.Vulnerabilities))
 	return nil
 }
 
@@ -846,7 +888,7 @@ func (sm *ScanManager) prepareTarget(target Target) ([]string, error) {
 	case DNSName:
 		ips, err := net.LookupIP(target.Value)
 		if err != nil {
-			return nil, fmt.Errorf("DNS lookup failed: %v", err)
+			return nil, fmt.Errorf("DNS lookup failed: %w", err)
 		}
 		result := make([]string, len(ips))
 		for i, ip := range ips {
@@ -906,7 +948,7 @@ func (m *ScanManager) SetScanOptions(options *ScanOptions) {
 	// Set the protocols for Nmap scan strategy
 	if strategy, ok := m.scanStrategies["nmap"].(*NmapStrategy); ok {
 		strategy.Protocols = protocols
-		log.Printf("NmapStrategy protocols set to: %v", strategy.Protocols)
+		slog.Debug("NmapStrategy protocols set", "protocols", strategy.Protocols)
 	}
 }
 
@@ -919,27 +961,29 @@ type ControlMessage struct {
 
 // ListenForCancelCommands starts listening for scan control commands on the scan_control queue.
 // This allows external systems (like the API) to cancel running scans.
+// Uses ListenWithRetry for resilient connection handling.
 func (sm *ScanManager) ListenForCancelCommands() {
-	log.Printf("🎛️  Starting scan control listener on queue 'scan_control'")
-	queue.Listen("scan_control", sm.handleControlMessage)
+	slog.Info("Starting scan control listener on queue", "queue", "scan_control")
+	queue.ListenWithRetry(sm.ctx, "scan_control", sm.handleControlMessage)
 }
 
 // handleControlMessage processes incoming control commands
 func (sm *ScanManager) handleControlMessage(msg string) {
 	var cmd ControlMessage
 	if err := json.Unmarshal([]byte(msg), &cmd); err != nil {
-		log.Printf("Invalid control message: %v", err)
+		slog.Error("Invalid control message", "error", err)
 		return
 	}
 
-	log.Printf("📩 Received control command: action=%s, scan_id=%s, timestamp=%s",
-		cmd.Action, cmd.ScanID, cmd.Timestamp)
+	slog.Debug("Received control command", "action", cmd.Action, "scan_id", cmd.ScanID, "timestamp", cmd.Timestamp)
 
 	switch cmd.Action {
 	case "cancel":
 		sm.CancelCurrentScan(cmd.ScanID)
+	case "force_cancel":
+		sm.ForceStopCurrentScan(cmd.ScanID)
 	default:
-		log.Printf("Unknown control action: %s", cmd.Action)
+		slog.Warn("Unknown control action", "action", cmd.Action)
 	}
 }
 
@@ -951,23 +995,23 @@ func (sm *ScanManager) CancelCurrentScan(scanID string) {
 
 	// If a specific scan ID is provided, verify it matches
 	if scanID != "" && sm.currentScanID != "" && scanID != sm.currentScanID {
-		log.Printf("⚠️  Cancel request for scan %s, but current scan is %s - ignoring", scanID, sm.currentScanID)
+		slog.Warn("Cancel request for scan does not match current scan, ignoring", "requested_scan_id", scanID, "current_scan_id", sm.currentScanID)
 		return
 	}
 
 	if sm.activeScanCancel == nil {
-		log.Printf("⚠️  No active scan in memory to cancel")
+		slog.Warn("No active scan in memory to cancel")
 		// Still update ValKey to clear any stale scan data that might be stuck
 		sm.clearStaleScanData(scanID)
 		return
 	}
 
 	if sm.isCancelling {
-		log.Printf("⚠️  Scan is already being cancelled")
+		slog.Warn("Scan is already being cancelled")
 		return
 	}
 
-	log.Printf("🛑 Cancelling scan %s...", sm.currentScanID)
+	slog.Debug("Cancelling scan", "scan_id", sm.currentScanID)
 	sm.isCancelling = true
 
 	// Cancel the scan context - this will propagate to all workers and external commands
@@ -982,7 +1026,48 @@ func (sm *ScanManager) CancelCurrentScan(scanID string) {
 		"timestamp": time.Now().Format(time.RFC3339),
 	})
 
-	log.Printf("✅ Scan %s has been cancelled", sm.currentScanID)
+	slog.Debug("Scan has been cancelled", "scan_id", sm.currentScanID)
+}
+
+// ForceStopCurrentScan forcefully stops the currently running scan.
+// Unlike CancelCurrentScan, this bypasses the isCancelling guard and resets
+// the cancellation state, allowing it to work even if a previous graceful
+// cancel is stuck. This is the Tier 2 escalation.
+func (sm *ScanManager) ForceStopCurrentScan(scanID string) {
+	sm.scanMutex.Lock()
+	defer sm.scanMutex.Unlock()
+
+	slog.Debug("Force stop requested for scan", "scan_id", scanID)
+
+	// If a specific scan ID is provided, verify it matches (but less strict than graceful)
+	if scanID != "" && sm.currentScanID != "" && scanID != sm.currentScanID {
+		slog.Warn("Force stop for scan does not match current scan, proceeding anyway", "requested_scan_id", scanID, "current_scan_id", sm.currentScanID)
+	}
+
+	if sm.activeScanCancel == nil {
+		slog.Warn("No active scan context to force stop, clearing stale data")
+		sm.isCancelling = false // Reset the flag regardless
+		sm.clearStaleScanData(scanID)
+		return
+	}
+
+	// Cancel the context regardless of isCancelling state
+	slog.Debug("Force cancelling scan context")
+	sm.activeScanCancel()
+
+	// Update scan status in ValKey
+	sm.updateScanStatus("cancelled")
+
+	// Reset the cancelling flag so the scanner can accept new scans
+	sm.isCancelling = false
+
+	// Log the force stop event
+	sm.logger.LogScanEvent(sm.currentScanID, "scan_force_stopped", "Scan was force stopped by user", map[string]interface{}{
+		"scan_id":   sm.currentScanID,
+		"timestamp": time.Now().Format(time.RFC3339),
+	})
+
+	slog.Debug("Force stop completed for scan", "scan_id", sm.currentScanID)
 }
 
 // updateScanStatus updates the scan status in ValKey
@@ -994,7 +1079,7 @@ func (sm *ScanManager) updateScanStatus(status string) {
 		}
 		return nil
 	}); err != nil {
-		log.Printf("Warning: failed to update scan status to '%s': %v", status, err)
+		slog.Warn("Failed to update scan status", "status", status, "error", err)
 	}
 }
 
@@ -1005,7 +1090,7 @@ func (sm *ScanManager) clearStaleScanData(scanID string) {
 
 	kvStore, err := store.NewValkeyStore()
 	if err != nil {
-		log.Printf("Warning: failed to connect to ValKey to clear stale data: %v", err)
+		slog.Warn("Failed to connect to ValKey to clear stale data", "error", err)
 		return
 	}
 	defer kvStore.Close()
@@ -1014,7 +1099,7 @@ func (sm *ScanManager) clearStaleScanData(scanID string) {
 	resp, err := kvStore.GetValue(ctx, "currentScan")
 	if err != nil {
 		// No scan data to clear
-		log.Printf("✅ No stale scan data found in ValKey")
+		slog.Debug("No stale scan data found in ValKey")
 		return
 	}
 
@@ -1022,7 +1107,7 @@ func (sm *ScanManager) clearStaleScanData(scanID string) {
 	decodedBytes, err := decodeBase64(resp.Message.Value)
 	if err != nil {
 		// If decode fails, just delete the key
-		log.Printf("Warning: stale data is not valid base64, deleting key")
+		slog.Warn("Stale data is not valid base64, deleting key")
 		kvStore.DeleteValue(ctx, "currentScan")
 		return
 	}
@@ -1030,7 +1115,7 @@ func (sm *ScanManager) clearStaleScanData(scanID string) {
 	// Parse the scan result
 	var scanResult map[string]interface{}
 	if err := json.Unmarshal(decodedBytes, &scanResult); err != nil {
-		log.Printf("Warning: stale data is not valid JSON, deleting key")
+		slog.Warn("Stale data is not valid JSON, deleting key")
 		kvStore.DeleteValue(ctx, "currentScan")
 		return
 	}
@@ -1043,11 +1128,11 @@ func (sm *ScanManager) clearStaleScanData(scanID string) {
 	encodedValue := encodeBase64(updatedJSON)
 
 	if err := kvStore.SetValue(ctx, "currentScan", encodedValue); err != nil {
-		log.Printf("Warning: failed to update stale scan status: %v", err)
+		slog.Warn("Failed to update stale scan status", "error", err)
 		return
 	}
 
-	log.Printf("✅ Cleared stale scan data from ValKey (marked as cancelled)")
+	slog.Debug("Cleared stale scan data from ValKey (marked as cancelled)")
 }
 
 // decodeBase64 decodes a base64 string

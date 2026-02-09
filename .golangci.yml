@@ -1,0 +1,46 @@
+# golangci-lint configuration for app-scanner
+# See https://golangci-lint.run/usage/configuration/
+
+run:
+  timeout: 5m
+  modules-download-mode: readonly
+
+linters:
+  enable:
+    - errcheck       # Check for unchecked errors
+    - govet          # Vet examines Go source code
+    - staticcheck    # Go static analysis
+    - unused         # Find unused code
+    - gosimple       # Simplify code
+    - ineffassign    # Detect ineffectual assignments
+    - typecheck      # Type-check Go code
+    - gocritic       # Opinionated Go linter
+    - revive         # Fast, configurable linter for Go
+
+linters-settings:
+  errcheck:
+    check-type-assertions: true
+  govet:
+    enable-all: true
+    disable:
+      - fieldalignment  # Too noisy for this project
+  revive:
+    rules:
+      - name: exported
+        disabled: true  # Don't enforce doc comments on all exports
+  gocritic:
+    enabled-tags:
+      - diagnostic
+      - style
+    disabled-checks:
+      - commentFormatting  # Don't enforce comment formatting
+
+issues:
+  exclude-dirs:
+    - cmd  # Test utilities use fmt.Print for CLI output
+  exclude-rules:
+    # Allow fmt.Errorf without %w in test files
+    - path: _test\.go
+      linters:
+        - errcheck
+        - gocritic

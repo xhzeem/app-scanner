@@ -1,7 +1,7 @@
 package scan
 
 import (
-	"log"
+	"log/slog"
 	"time"
 )
 
@@ -39,7 +39,7 @@ func (f *ScanToolFactory) CreateTool(toolType string) ScanStrategy {
 			if scanType == "smb" {
 				// If SMB is specifically requested, focus on SMB protocol
 				nmapStrategy.Protocols = []string{"smb"}
-				log.Printf("Setting NmapStrategy to focus on SMB protocol")
+				slog.Debug("setting NmapStrategy to focus on SMB protocol")
 				break
 			}
 		}
@@ -49,10 +49,10 @@ func (f *ScanToolFactory) CreateTool(toolType string) ScanStrategy {
 		// Fingerprint strategy is handled differently since it has a separate interface.
 		// The manager uses CreateFingerprintTool() for this scan type.
 		// This case is here for completeness but should not be used directly.
-		log.Printf("Warning: fingerprint type requested via CreateTool - use CreateFingerprintTool instead")
+		slog.Warn("fingerprint type requested via CreateTool - use CreateFingerprintTool instead")
 		return nil
 	default:
-		log.Printf("No valid scan strategy for type: %s", toolType)
+		slog.Warn("no valid scan strategy for type", "tool_type", toolType)
 		return nil
 	}
 }
@@ -74,8 +74,8 @@ func (f *ScanToolFactory) CreateFingerprintTool() FingerprintStrategy {
 		if timeout, err := time.ParseDuration(f.currentOptions.FingerprintTimeout); err == nil {
 			opts.Timeout = timeout
 		} else {
-			log.Printf("Warning: invalid fingerprint timeout '%s', using default: %v",
-				f.currentOptions.FingerprintTimeout, DefaultFingerprintTimeout)
+			slog.Warn("invalid fingerprint timeout, using default",
+				"timeout", f.currentOptions.FingerprintTimeout, "default", DefaultFingerprintTimeout)
 		}
 	}
 

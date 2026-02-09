@@ -6,8 +6,10 @@ import (
 	"context"
 	"encoding/xml"
 	"fmt"
+	"log/slog"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"regexp"
 	"strings"
 
@@ -79,7 +81,7 @@ func executeNmapWithConfig(config ScanConfig) (string, error) {
 		if len(config.ScriptList) == 1 && config.ScriptList[0] == "*" {
 			// Special case: wildcard means all scripts
 			// Get script selector to build full script list
-			repoManager := nse.NewRepoManager("/opt/sirius/nse/sirius-nse", nse.NSERepoURL)
+			repoManager := nse.NewRepoManager(nse.NSEBasePath, nse.NSERepoURL)
 			manifest, err := repoManager.GetManifest()
 			if err != nil {
 				return "", fmt.Errorf("failed to get NSE manifest: %w", err)
@@ -94,13 +96,13 @@ func executeNmapWithConfig(config ScanConfig) (string, error) {
 		} else {
 			// Use provided script list directly
 			scriptFlag = strings.Join(config.ScriptList, ",")
-			fmt.Printf("🎯 Using template script list: %d scripts\n", len(config.ScriptList))
+			slog.Debug("using template script list", "script_count", len(config.ScriptList))
 			// Infer protocols from script list for port selection
 			protocols = inferProtocolsFromScripts(config.ScriptList)
 		}
 	} else {
 		// Legacy protocol-based selection
-		repoManager := nse.NewRepoManager("/opt/sirius/nse/sirius-nse", nse.NSERepoURL)
+		repoManager := nse.NewRepoManager(nse.NSEBasePath, nse.NSERepoURL)
 		manifest, err := repoManager.GetManifest()
 		if err != nil {
 			return "", fmt.Errorf("failed to get NSE manifest: %w", err)
@@ -120,10 +122,10 @@ func executeNmapWithConfig(config ScanConfig) (string, error) {
 
 	// Potential script args file locations
 	argsFilePaths := []string{
-		"/opt/sirius/nse/sirius-nse/scripts/args.txt", // Docker NSE path
-		"/app-scanner/modules/nmap/args/args.txt",     // Docker app-scanner path (production)
-		"/app-scanner-src/modules/nmap/args/args.txt", // Docker app-scanner-src path (development)
-		"modules/nmap/args/args.txt",                  // Local path (relative to working directory)
+		filepath.Join(nse.NSEBasePath, "scripts", "args.txt"), // Docker NSE path
+		"/app-scanner/modules/nmap/args/args.txt",             // Docker app-scanner path (production)
+		"/app-scanner-src/modules/nmap/args/args.txt",         // Docker app-scanner-src path (development)
+		"modules/nmap/args/args.txt",                          // Local path (relative to working directory)
 	}
 
 	// Find the first args file that exists
@@ -152,7 +154,7 @@ func executeNmapWithConfig(config ScanConfig) (string, error) {
 		args = append(args, "-Pn") // Skip host discovery - we know host is up from enumeration
 	}
 
-	fmt.Printf("📌 Using port range: %s\n", config.PortRange)
+	slog.Debug("using port range", "port_range", config.PortRange)
 	args = append(args, "-p", config.PortRange)
 
 	// Add script flag (Nmap will use sirius-nse scripts via symlink)
@@ -167,18 +169,16 @@ func executeNmapWithConfig(config ScanConfig) (string, error) {
 	args = append(args, config.Target, "-oX", "-", "-v")
 
 	// Log the full Nmap command for debugging
-	fmt.Printf("🔍 Executing Nmap command: nmap %s\n", strings.Join(args, " "))
+	slog.Debug("executing nmap command", "args", strings.Join(args, " "))
 
-	// #region agent log
-	// Debug: Log context state before starting Nmap
+	// Log context state before starting Nmap
 	if config.Ctx == nil {
-		fmt.Println("⚠️  [DEBUG] Nmap starting with NIL context - cancellation will NOT work!")
+		slog.Warn("nmap starting with nil context - cancellation will not work")
 	} else if config.Ctx == context.Background() {
-		fmt.Println("⚠️  [DEBUG] Nmap starting with context.Background() - cancellation will NOT work!")
+		slog.Warn("nmap starting with context.Background() - cancellation will not work")
 	} else {
-		fmt.Println("✅ [DEBUG] Nmap starting with cancellable context")
+		slog.Debug("nmap starting with cancellable context")
 	}
-	// #endregion
 
 	// Use CommandContext for cancellation support
 	cmd := exec.CommandContext(config.Ctx, "nmap", args...)
@@ -186,11 +186,11 @@ func executeNmapWithConfig(config ScanConfig) (string, error) {
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 
-	fmt.Println("⏳ Running Nmap scan (this may take several minutes)...")
+	slog.Info("running nmap scan (this may take several minutes)")
 	if err := cmd.Run(); err != nil {
 		// Check if context was cancelled
 		if config.Ctx.Err() != nil {
-			fmt.Println("🛑 Nmap scan cancelled")
+			slog.Info("nmap scan cancelled")
 			return "", fmt.Errorf("scan cancelled: %w", config.Ctx.Err())
 		}
 
@@ -200,8 +200,7 @@ func executeNmapWithConfig(config ScanConfig) (string, error) {
 		if strings.Contains(stderrStr, "did not match a category, filename, or directory") ||
 			strings.Contains(stderrStr, "NSE: failed to initialize the script engine") {
 			// Log the script error but don't fail the entire scan
-			fmt.Printf("⚠️  NSE Script Error (non-fatal): %s\n", stderrStr)
-			fmt.Println("🔄  Attempting fallback scan without problematic scripts...")
+			slog.Warn("NSE script error (non-fatal), attempting fallback scan", "stderr", stderrStr)
 
 			// Retry with a minimal safe script set
 			return executeFallbackScan(config)
@@ -211,14 +210,14 @@ func executeNmapWithConfig(config ScanConfig) (string, error) {
 		return "", fmt.Errorf("error executing Nmap: %w\nStderr: %s", err, stderrStr)
 	}
 
-	fmt.Println("✅ Nmap scan completed successfully")
+	slog.Info("nmap scan completed successfully")
 	return stdout.String(), nil
 }
 
 // executeFallbackScan runs a basic Nmap scan with only safe, essential scripts
 // This is used when the full script scan fails due to script errors
 func executeFallbackScan(config ScanConfig) (string, error) {
-	fmt.Println("🛡️  Running fallback scan with minimal safe scripts...")
+	slog.Info("running fallback scan with minimal safe scripts")
 
 	// Port range is required - use the same ports from the original scan config
 	if config.PortRange == "" {
@@ -266,7 +265,7 @@ func executeFallbackScan(config ScanConfig) (string, error) {
 		return "", fmt.Errorf("fallback scan also failed: %w\nStderr: %s", err, stderr.String())
 	}
 
-	fmt.Println("✅  Fallback scan completed successfully")
+	slog.Info("fallback scan completed successfully")
 	return stdout.String(), nil
 }
 
@@ -282,7 +281,7 @@ func processNmapOutput(output string) (sirius.Host, error) {
 
 	var nmapRun nmap.NmapRun
 	if err := xml.Unmarshal([]byte(output), &nmapRun); err != nil {
-		return host, fmt.Errorf("Error unmarshalling XML: %v", err)
+		return host, fmt.Errorf("error unmarshalling XML: %w", err)
 	}
 
 	if len(nmapRun.Hosts) == 0 {
@@ -390,7 +389,7 @@ func extractVulnerabilities(result ScriptResult) []sirius.Vulnerability {
 	var vulns []sirius.Vulnerability
 
 	// Log the script result for debugging
-	fmt.Printf("📋 Processing script result: %s\n", result.ID)
+	slog.Debug("processing script result", "script_id", result.ID)
 
 	// Check if this is an SMB vulnerability script
 	if strings.HasPrefix(result.ID, "smb-vuln") {
@@ -448,7 +447,7 @@ func extractVulnerabilities(result ScriptResult) []sirius.Vulnerability {
 		}
 	}
 
-	fmt.Printf("🔍 Found %d vulnerabilities from script %s\n", len(vulns), result.ID)
+	slog.Debug("found vulnerabilities from script", "vuln_count", len(vulns), "script_id", result.ID)
 	return vulns
 }
 

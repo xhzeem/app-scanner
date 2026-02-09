@@ -1,6 +1,7 @@
 package nse
 
 import (
+	"log/slog"
 	"path/filepath"
 	"strings"
 )
@@ -78,7 +79,7 @@ func (s *ScriptSelector) BuildNmapScriptFlag(protocols ...string) (string, error
 
 	// Log blacklist statistics if any scripts were filtered
 	if blacklistCount > 0 {
-		println("🚫 Filtered", blacklistCount, "blacklisted scripts")
+		slog.Debug("filtered blacklisted scripts", "count", blacklistCount)
 	}
 
 	// For wildcard scans, use ONLY high-value CVE detection scripts
@@ -107,7 +108,7 @@ func (s *ScriptSelector) BuildNmapScriptFlag(protocols ...string) (string, error
 		// Add all essential scripts to the list
 		scriptIDs = essentialScripts
 
-		println("🎯 Wildcard scan - using minimal high-value CVE detection scripts")
+		slog.Debug("wildcard scan - using minimal high-value CVE detection scripts")
 	}
 
 	if len(scriptIDs) == 0 {
@@ -120,7 +121,7 @@ func (s *ScriptSelector) BuildNmapScriptFlag(protocols ...string) (string, error
 	scriptList := strings.Join(scriptIDs, ",")
 
 	// Log the final script count for debugging
-	println("🎯  Vulnerability scan with", len(scriptIDs), "scripts")
+	slog.Debug("vulnerability scan script selection complete", "script_count", len(scriptIDs))
 
 	return scriptList, nil
 }

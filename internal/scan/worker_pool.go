@@ -2,7 +2,7 @@ package scan
 
 import (
 	"context"
-	"log"
+	"log/slog"
 	"sync"
 )
 
@@ -53,19 +53,19 @@ func (wp *WorkerPool) AddTask(task ScanTask) {
 func (wp *WorkerPool) worker(ctx context.Context, id int) {
 	defer wp.wg.Done()
 
-	log.Printf("Worker %d started", id)
+	slog.Info("worker started", "worker_id", id)
 
 	for {
 		select {
 		case task, ok := <-wp.tasks:
 			if !ok {
-				log.Printf("Worker %d shutting down", id)
+				slog.Info("worker shutting down", "worker_id", id)
 				return
 			}
 
 			// Check if context is cancelled before processing
 			if ctx.Err() != nil {
-				log.Printf("Worker %d skipping task for %s - context cancelled", id, task.IP)
+				slog.Debug("worker skipping task - context cancelled", "worker_id", id, "ip", task.IP)
 				continue
 			}
 
@@ -80,7 +80,7 @@ func (wp *WorkerPool) worker(ctx context.Context, id int) {
 			wp.manager.scanIP(scanCtx, task.IP)
 
 		case <-ctx.Done():
-			log.Printf("Worker %d context cancelled", id)
+			slog.Info("worker context cancelled", "worker_id", id)
 			return
 		}
 	}

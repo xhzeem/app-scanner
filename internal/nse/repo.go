@@ -2,7 +2,7 @@ package nse
 
 import (
 	"fmt"
-	"log"
+	"log/slog"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -71,13 +71,13 @@ func (r *RepoManager) EnsureRepo() error {
 	// Check if repository exists
 	if !r.isGitRepo() {
 		// Clone repository if it doesn't exist
-		log.Printf("Cloning repository to %s", r.BasePath)
+		slog.Info("cloning repository", "path", r.BasePath)
 		if err := r.gitOps.Clone(r.RepoURL, r.BasePath); err != nil {
 			return fmt.Errorf("failed to clone repository: %w", err)
 		}
 	} else {
 		// Update existing repository
-		log.Printf("Updating repository at %s", r.BasePath)
+		slog.Info("updating repository", "path", r.BasePath)
 		if err := r.updateRepo(); err != nil {
 			return fmt.Errorf("failed to update repository: %w", err)
 		}
@@ -97,36 +97,32 @@ func (rm *RepoManager) isGitRepo() bool {
 
 // updateRepo updates the NSE script repository
 func (rm *RepoManager) updateRepo() error {
-	log.Printf("Updating NSE script repository at %s", rm.BasePath)
+	slog.Info("updating NSE script repository", "path", rm.BasePath)
 
 	// Fetch latest changes
-	fmt.Println("📥 Fetching latest changes from remote repository...")
+	slog.Debug("fetching latest changes from remote repository")
 	if err := rm.gitOps.Fetch(rm.BasePath); err != nil {
 		return fmt.Errorf("failed to fetch repository: %w", err)
 	}
 
 	// Check if there are updates
+	commitsPulled := "unknown"
 	cmd := exec.Command("git", "rev-list", "--count", "HEAD..origin/main")
 	cmd.Dir = rm.BasePath
 	output, err := cmd.Output()
 	if err != nil {
-		fmt.Printf("⚠️ Warning: Failed to check for updates: %v\n", err)
+		slog.Warn("failed to check for updates", "error", err)
 	} else {
-		count := strings.TrimSpace(string(output))
-		if count != "0" {
-			fmt.Printf("🆕 New changes detected! %s commit(s) to pull\n", count)
-		} else {
-			fmt.Println("✅ Repository already up to date")
-		}
+		commitsPulled = strings.TrimSpace(string(output))
 	}
 
 	// Reset to origin/main
-	fmt.Println("🔄 Resetting to latest remote version...")
+	slog.Debug("resetting to latest remote version")
 	if err := rm.gitOps.Reset(rm.BasePath); err != nil {
 		return fmt.Errorf("failed to reset repository: %w", err)
 	}
 
-	fmt.Println("✅ Repository successfully updated")
+	slog.Info("repository update complete", "path", rm.BasePath, "commits_pulled", commitsPulled)
 	return nil
 }
 

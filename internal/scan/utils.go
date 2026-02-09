@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"net"
 	"strings"
+
+	"github.com/SiriusScan/go-api/sirius/store"
 )
 
 // ============================================================================
@@ -18,6 +20,54 @@ func contains(slice []string, str string) bool {
 		}
 	}
 	return false
+}
+
+// findHostByIP returns the index of a HostEntry with the given IP, or -1 if not found.
+func findHostByIP(hosts []store.HostEntry, ip string) int {
+	for i, h := range hosts {
+		if h.IP == ip {
+			return i
+		}
+	}
+	return -1
+}
+
+// mergeHost adds a host to the hosts slice or merges source info if it already exists.
+// Returns the updated slice and whether the host was newly added.
+func mergeHost(hosts []store.HostEntry, ip, hostname, source string) ([]store.HostEntry, bool) {
+	idx := findHostByIP(hosts, ip)
+	if idx >= 0 {
+		// Host exists — merge source and hostname
+		h := &hosts[idx]
+		if hostname != "" && h.Hostname == "" {
+			h.Hostname = hostname
+		}
+		if source != "" {
+			found := false
+			for _, s := range h.Sources {
+				if s == source {
+					found = true
+					break
+				}
+			}
+			if !found {
+				h.Sources = append(h.Sources, source)
+			}
+		}
+		return hosts, false
+	}
+	// New host
+	sources := []string{}
+	if source != "" {
+		sources = []string{source}
+	}
+	entry := store.HostEntry{
+		ID:       ip,
+		IP:       ip,
+		Hostname: hostname,
+		Sources:  sources,
+	}
+	return append(hosts, entry), true
 }
 
 // containsAny checks if any item in a slice contains the target string (case-insensitive)
@@ -61,7 +111,7 @@ func expandCIDR(cidr string) ([]string, error) {
 	// Parse CIDR notation
 	_, ipnet, err := net.ParseCIDR(cidr)
 	if err != nil {
-		return nil, fmt.Errorf("invalid CIDR notation: %v", err)
+		return nil, fmt.Errorf("invalid CIDR notation: %w", err)
 	}
 
 	// Get network details

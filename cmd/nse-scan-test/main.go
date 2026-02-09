@@ -79,8 +79,6 @@ func main() {
 		log.Fatalf("Failed to get manifest: %v", err)
 	}
 
-	// Create script selector
-	_ = nse.NewScriptSelector(manifest) // We don't need to use this directly anymore
 	fmt.Printf("📄 Loaded manifest with %d scripts\n", len(manifest.Scripts))
 
 	// Create scan configuration

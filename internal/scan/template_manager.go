@@ -4,7 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"log"
+	"log/slog"
 	"strings"
 	"time"
 
@@ -78,7 +78,7 @@ func (tm *TemplateManager) CreateTemplate(ctx context.Context, template *Templat
 		}
 	}
 
-	log.Printf("Created template: %s (%s)", template.Name, template.ID)
+	slog.Info("created template", "template_name", template.Name, "template_id", template.ID)
 	return nil
 }
 
@@ -117,7 +117,7 @@ func (tm *TemplateManager) UpdateTemplate(ctx context.Context, template *Templat
 		return fmt.Errorf("failed to update template: %w", err)
 	}
 
-	log.Printf("Updated template: %s (%s)", template.Name, template.ID)
+	slog.Info("updated template", "template_name", template.Name, "template_id", template.ID)
 	return nil
 }
 
@@ -142,10 +142,10 @@ func (tm *TemplateManager) DeleteTemplate(ctx context.Context, id string) error 
 
 	// Remove from template list
 	if err := tm.removeFromTemplateList(ctx, id); err != nil {
-		log.Printf("Warning: failed to remove template from list: %v", err)
+		slog.Warn("failed to remove template from list", "error", err)
 	}
 
-	log.Printf("Deleted template: %s (%s)", template.Name, id)
+	slog.Info("deleted template", "template_name", template.Name, "template_id", id)
 	return nil
 }
 
@@ -171,7 +171,7 @@ func (tm *TemplateManager) ListTemplates(ctx context.Context) ([]Template, error
 	for _, id := range templateList.Templates {
 		template, err := tm.GetTemplate(ctx, id)
 		if err != nil {
-			log.Printf("Warning: failed to get template %s: %v", id, err)
+			slog.Warn("failed to get template", "template_id", id, "error", err)
 			continue
 		}
 		templates = append(templates, *template)
@@ -204,7 +204,7 @@ const (
 
 // InitializeSystemTemplates creates the default system templates if they don't exist
 func (tm *TemplateManager) InitializeSystemTemplates(ctx context.Context) error {
-	log.Println("Initializing system templates...")
+	slog.Info("initializing system templates")
 
 	systemTemplates := []Template{
 		{
@@ -287,40 +287,108 @@ func (tm *TemplateManager) InitializeSystemTemplates(ctx context.Context) error 
 				Parallel:   true,
 			},
 		},
+		{
+			ID:             "agent-only",
+			Name:           "Agent Only Scan",
+			Description:    "Runs agent-based vulnerability detection without network scanning. Requires connected agents.",
+			Type:           SystemTemplate,
+			EnabledScripts: []string{},
+			ScanOptions: TemplateOptions{
+				ScanTypes: []string{},
+				AgentScan: &AgentScanConfig{
+					Enabled:     true,
+					Mode:        "comprehensive",
+					AgentIDs:    []string{},
+					Timeout:     300,
+					Concurrency: 5,
+				},
+			},
+		},
+		{
+			ID:          "full-scan",
+			Name:        "Full Scan (Network + Agent)",
+			Description: "Comprehensive scan combining network scanning with agent-based vulnerability detection for maximum coverage.",
+			Type:        SystemTemplate,
+			EnabledScripts: []string{
+				"vulners",
+				"smb-vuln-ms17-010.nse",
+				"smb-vuln-ms08-067.nse",
+				"ssl-heartbleed.nse",
+				"ssl-poodle.nse",
+				"ssl-ccs-injection.nse",
+				"http-shellshock.nse",
+				"banner.nse",
+				"http-title.nse",
+				"ssl-cert.nse",
+				"smb-os-discovery.nse",
+				"ftp-anon.nse",
+				"smb-enum-shares.nse",
+			},
+			ScanOptions: TemplateOptions{
+				ScanTypes:  []string{"fingerprint", "enumeration", "discovery", "vulnerability"},
+				PortRange:  "",
+				Aggressive: true,
+				MaxRetries: 2,
+				Parallel:   true,
+				AgentScan: &AgentScanConfig{
+					Enabled:     true,
+					Mode:        "comprehensive",
+					AgentIDs:    []string{},
+					Timeout:     300,
+					Concurrency: 5,
+				},
+			},
+		},
 	}
 
 	// Load all NSE scripts from manifest to replace "*" wildcard
 	allScripts, err := tm.loadAllNSEScripts(ctx)
 	if err != nil {
-		log.Printf("Warning: failed to load NSE scripts for 'all' template: %v", err)
-		log.Println("'All Scripts' template will use wildcard - may not work correctly")
+		slog.Warn("failed to load NSE scripts for 'all' template, wildcard may not work correctly", "error", err)
 	} else {
 		// Replace "*" wildcard with actual script list
 		for i := range systemTemplates {
 			if systemTemplates[i].ID == "all" && len(systemTemplates[i].EnabledScripts) == 1 && systemTemplates[i].EnabledScripts[0] == "*" {
 				systemTemplates[i].EnabledScripts = allScripts
-				log.Printf("Loaded %d NSE scripts for 'All Scripts' template", len(allScripts))
+				slog.Info("loaded NSE scripts for 'All Scripts' template", "script_count", len(allScripts))
 				break
 			}
 		}
 	}
 
-	// Create each system template
+	// Create or update each system template
+	var created, updated, skipped int
 	for _, template := range systemTemplates {
 		// Check if template already exists
 		existing, err := tm.GetTemplate(ctx, template.ID)
 		if err == nil && existing != nil {
-			log.Printf("System template '%s' already exists, skipping", template.ID)
+			// Update system templates when the new definition has agent_scan but the stored one doesn't.
+			// This handles the case where templates were seeded before agent scan support was added.
+			needsUpdate := false
+			if template.ScanOptions.AgentScan != nil && existing.ScanOptions.AgentScan == nil {
+				needsUpdate = true
+				slog.Debug("system template missing agent_scan config, updating", "template_id", template.ID)
+			}
+			if !needsUpdate {
+				skipped++
+				continue
+			}
+			// Overwrite with the canonical definition
+			if err := tm.UpdateTemplate(ctx, &template); err != nil {
+				slog.Warn("failed to update system template", "template_id", template.ID, "error", err)
+			} else {
+				updated++
+			}
 			continue
 		}
 
 		if err := tm.CreateTemplate(ctx, &template); err != nil {
 			return fmt.Errorf("failed to create system template '%s': %w", template.ID, err)
 		}
-		log.Printf("Created system template: %s", template.Name)
+		created++
 	}
 
-	log.Println("System templates initialized successfully")
+	slog.Info("system templates initialized", "created", created, "updated", updated, "skipped", skipped)
 	return nil
 }
 
@@ -362,12 +430,35 @@ func (tm *TemplateManager) validateTemplate(template *Template) error {
 	if template.Name == "" {
 		return fmt.Errorf("template name is required")
 	}
-	if len(template.EnabledScripts) == 0 {
-		return fmt.Errorf("template must have at least one enabled script")
+
+	// Agent-only profiles don't require network scan scripts or scan types
+	isAgentOnly := template.ScanOptions.AgentScan != nil &&
+		template.ScanOptions.AgentScan.Enabled &&
+		len(template.ScanOptions.ScanTypes) == 0
+
+	if !isAgentOnly {
+		if len(template.EnabledScripts) == 0 {
+			return fmt.Errorf("template must have at least one enabled script")
+		}
+		if len(template.ScanOptions.ScanTypes) == 0 {
+			return fmt.Errorf("template must have at least one scan type")
+		}
 	}
-	if len(template.ScanOptions.ScanTypes) == 0 {
-		return fmt.Errorf("template must have at least one scan type")
+
+	// Validate agent scan config if present
+	if template.ScanOptions.AgentScan != nil && template.ScanOptions.AgentScan.Enabled {
+		validModes := map[string]bool{"comprehensive": true, "templates-only": true, "scripts-only": true}
+		if !validModes[template.ScanOptions.AgentScan.Mode] {
+			return fmt.Errorf("invalid agent scan mode: %s", template.ScanOptions.AgentScan.Mode)
+		}
+		if template.ScanOptions.AgentScan.Timeout <= 0 {
+			template.ScanOptions.AgentScan.Timeout = 300
+		}
+		if template.ScanOptions.AgentScan.Concurrency <= 0 {
+			template.ScanOptions.AgentScan.Concurrency = 5
+		}
 	}
+
 	return nil
 }
 
@@ -485,4 +576,3 @@ func (tm *TemplateManager) addToSystemTemplatesList(ctx context.Context, id stri
 
 	return nil
 }
-

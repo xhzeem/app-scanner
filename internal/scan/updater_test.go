@@ -80,7 +80,7 @@ func (f *fakeKVStore) Close() error {
 func TestScanUpdater_Update(t *testing.T) {
 	// Create an initial ScanResult with no hosts.
 	initialScanResult := store.ScanResult{
-		Hosts:           []string{},
+		Hosts:           []store.HostEntry{},
 		HostsCompleted:  0,
 		Vulnerabilities: []store.VulnerabilitySummary{},
 	}
@@ -102,7 +102,7 @@ func TestScanUpdater_Update(t *testing.T) {
 
 	// Define a modifier function that adds a host.
 	modifier := func(scan *store.ScanResult) error {
-		scan.Hosts = append(scan.Hosts, "192.168.1.1")
+		scan.Hosts, _ = mergeHost(scan.Hosts, "192.168.1.1", "", "network")
 		scan.HostsCompleted = 1
 		return nil
 	}
@@ -128,8 +128,8 @@ func TestScanUpdater_Update(t *testing.T) {
 	}
 
 	// Verify that the host was added.
-	if len(updatedScan.Hosts) != 1 || updatedScan.Hosts[0] != "192.168.1.1" {
-		t.Errorf("Expected hosts to contain '192.168.1.1', got %v", updatedScan.Hosts)
+	if len(updatedScan.Hosts) != 1 || updatedScan.Hosts[0].IP != "192.168.1.1" {
+		t.Errorf("Expected hosts to contain entry with IP '192.168.1.1', got %v", updatedScan.Hosts)
 	}
 	if updatedScan.HostsCompleted != 1 {
 		t.Errorf("Expected HostsCompleted to be 1, got %d", updatedScan.HostsCompleted)

@@ -70,7 +70,7 @@ func scanImpl(target string, config ScanConfig) (sirius.Host, error) {
 
 	naabuRunner, err := runner.NewRunner(&options)
 	if err != nil {
-		return sirius.Host{}, fmt.Errorf("failed to create naabu runner: %v", err)
+		return sirius.Host{}, fmt.Errorf("failed to create naabu runner: %w", err)
 	}
 	defer naabuRunner.Close()
 
@@ -80,7 +80,7 @@ func scanImpl(target string, config ScanConfig) (sirius.Host, error) {
 		if ctx.Err() != nil {
 			return sirius.Host{}, fmt.Errorf("naabu scan cancelled: %w", ctx.Err())
 		}
-		return sirius.Host{}, fmt.Errorf("naabu enumeration failed: %v", err)
+		return sirius.Host{}, fmt.Errorf("naabu enumeration failed: %w", err)
 	}
 
 	if len(results) == 0 {

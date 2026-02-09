@@ -6,7 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"log"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -41,32 +41,32 @@ func (sm *SyncManager) loadRepositories(ctx context.Context) (*RepositoryList, e
 		// Check for key not found errors (valkey nil message or "not found")
 		if strings.Contains(err.Error(), "valkey nil message") || strings.Contains(err.Error(), "not found") {
 			// Load built-in repository list
-			log.Printf("No repository manifest found in ValKey, loading built-in manifest")
+			slog.Info("no repository manifest found in ValKey, loading built-in manifest")
 			builtInList, err := LoadRepositoryList("internal/nse/manifest.json")
 			if err != nil {
-				return nil, fmt.Errorf("failed to load built-in repository list: %v", err)
+				return nil, fmt.Errorf("failed to load built-in repository list: %w", err)
 			}
 
 			// Initialize ValKey with built-in list
 			manifestJSON, err := json.Marshal(builtInList)
 			if err != nil {
-				return nil, fmt.Errorf("failed to marshal repository list: %v", err)
+				return nil, fmt.Errorf("failed to marshal repository list: %w", err)
 			}
 
 			if err := sm.kvStore.SetValue(ctx, ValKeyRepoManifestKey, string(manifestJSON)); err != nil {
-				return nil, fmt.Errorf("failed to initialize ValKey repository manifest: %v", err)
+				return nil, fmt.Errorf("failed to initialize ValKey repository manifest: %w", err)
 			}
 
-			log.Printf("Successfully initialized ValKey repository manifest")
+			slog.Info("successfully initialized ValKey repository manifest")
 			return builtInList, nil
 		}
-		return nil, fmt.Errorf("failed to get repository manifest from ValKey: %v", err)
+		return nil, fmt.Errorf("failed to get repository manifest from ValKey: %w", err)
 	}
 
 	// Parse ValKey response
 	var repoList RepositoryList
 	if err := json.Unmarshal([]byte(resp.Message.Value), &repoList); err != nil {
-		return nil, fmt.Errorf("failed to unmarshal repository manifest from ValKey: %v", err)
+		return nil, fmt.Errorf("failed to unmarshal repository manifest from ValKey: %w", err)
 	}
 
 	return &repoList, nil
@@ -77,12 +77,12 @@ func (sm *SyncManager) Sync(ctx context.Context) error {
 	// Load repositories from ValKey or initialize from built-in list
 	repoList, err := sm.loadRepositories(ctx)
 	if err != nil {
-		return fmt.Errorf("failed to load repositories: %v", err)
+		return fmt.Errorf("failed to load repositories: %w", err)
 	}
 
 	// Process each repository
 	for _, repo := range repoList.Repositories {
-		log.Printf("Processing repository: %s", repo.Name)
+		slog.Info("processing repository", "repo", repo.Name)
 
 		// Create a new repo manager for this repository
 		repoPath := filepath.Join(sm.repoManager.BasePath, "..", repo.Name)
@@ -90,11 +90,11 @@ func (sm *SyncManager) Sync(ctx context.Context) error {
 
 		// Check if repository already exists and has a manifest (development/volume mount scenario)
 		if repoManager.isGitRepo() {
-			log.Printf("Repository %s already exists, using local copy", repo.Name)
+			slog.Debug("repository already exists, using local copy", "repo", repo.Name)
 		} else {
 			// Ensure repository is cloned (production scenario)
 			if err := repoManager.EnsureRepo(); err != nil {
-				log.Printf("Warning: failed to ensure repository %s: %v", repo.Name, err)
+				slog.Warn("failed to ensure repository", "repo", repo.Name, "error", err)
 				continue
 			}
 		}
@@ -102,7 +102,7 @@ func (sm *SyncManager) Sync(ctx context.Context) error {
 		// Get local manifest from repository
 		localManifest, err := repoManager.GetManifest()
 		if err != nil {
-			log.Printf("Warning: failed to get manifest from repository %s: %v", repo.Name, err)
+			slog.Warn("failed to get manifest from repository", "repo", repo.Name, "error", err)
 			continue
 		}
 
@@ -112,15 +112,15 @@ func (sm *SyncManager) Sync(ctx context.Context) error {
 			// Check for key not found errors
 			if strings.Contains(err.Error(), "not found") {
 				// If no global manifest exists, initialize it with local manifest
-				fmt.Printf("📝 No manifest found in ValKey, initializing with local manifest: %s\n", localManifest.Name)
+				slog.Info("no manifest found in ValKey, initializing with local manifest", "manifest", localManifest.Name)
 				if err := sm.updateValKeyManifest(ctx, localManifest); err != nil {
-					log.Printf("Warning: failed to initialize ValKey manifest for %s: %v", repo.Name, err)
+					slog.Warn("failed to initialize ValKey manifest", "repo", repo.Name, "error", err)
 					continue
 				}
-				fmt.Println("✅ Successfully initialized ValKey manifest")
+				slog.Info("successfully initialized ValKey manifest")
 				globalManifest = localManifest
 			} else {
-				log.Printf("Warning: failed to get ValKey manifest for %s: %v", repo.Name, err)
+				slog.Warn("failed to get ValKey manifest", "repo", repo.Name, "error", err)
 				continue
 			}
 		}
@@ -130,19 +130,22 @@ func (sm *SyncManager) Sync(ctx context.Context) error {
 
 		// Update ValKey with merged manifest
 		if err := sm.updateValKeyManifest(ctx, mergedManifest); err != nil {
-			log.Printf("Warning: failed to update ValKey manifest for %s: %v", repo.Name, err)
+			slog.Warn("failed to update ValKey manifest", "repo", repo.Name, "error", err)
 			continue
 		}
 
 		// Sync each script's content
+		var synced, failed int
 		for id, script := range mergedManifest.Scripts {
-			fmt.Printf("🔄 Syncing script: %s\n", id)
 			if err := sm.syncScriptContent(id, script); err != nil {
-				log.Printf("Warning: failed to sync script %s: %v", id, err)
+				failed++
+				slog.Debug("failed to sync script", "script_id", id, "error", err)
 				continue
 			}
-			fmt.Printf("✅ Successfully synced script: %s\n", id)
+			synced++
 		}
+		slog.Info("script sync complete", "repo", repo.Name,
+			"synced", synced, "failed", failed, "total", len(mergedManifest.Scripts))
 	}
 
 	return nil
@@ -151,8 +154,7 @@ func (sm *SyncManager) Sync(ctx context.Context) error {
 // mergeManifests merges two manifests with global taking precedence
 // But ensures new scripts from local are added to the merged result
 func (sm *SyncManager) mergeManifests(global, local *Manifest) *Manifest {
-	fmt.Printf("📋 Merging manifests: Global (%d scripts) + Local (%d scripts)\n",
-		len(global.Scripts), len(local.Scripts))
+	slog.Debug("merging manifests", "global_scripts", len(global.Scripts), "local_scripts", len(local.Scripts))
 
 	merged := &Manifest{
 		Name:        global.Name,        // Use global name
@@ -165,7 +167,7 @@ func (sm *SyncManager) mergeManifests(global, local *Manifest) *Manifest {
 	for id, script := range local.Scripts {
 		merged.Scripts[id] = script
 		if _, exists := global.Scripts[id]; !exists {
-			fmt.Printf("📦 Found new script in repository: %s\n", id)
+			slog.Debug("found new script in repository", "script_id", id)
 		}
 	}
 
@@ -174,7 +176,7 @@ func (sm *SyncManager) mergeManifests(global, local *Manifest) *Manifest {
 		merged.Scripts[id] = script
 	}
 
-	fmt.Printf("📋 Merged manifest now contains %d scripts\n", len(merged.Scripts))
+	slog.Debug("merged manifest complete", "script_count", len(merged.Scripts))
 	return merged
 }
 
@@ -253,23 +255,23 @@ func (sm *SyncManager) getValKeyManifest(ctx context.Context) (*Manifest, error)
 	if err != nil {
 		if strings.Contains(err.Error(), "valkey nil message") {
 			// Initialize empty manifest if it doesn't exist
-			log.Printf("No manifest found in ValKey, initializing empty manifest")
+			slog.Info("no manifest found in ValKey, initializing empty manifest")
 			emptyManifest := &Manifest{
 				Scripts: make(map[string]Script),
 			}
 			err = sm.updateValKeyManifest(ctx, emptyManifest)
 			if err != nil {
-				return nil, fmt.Errorf("failed to initialize empty manifest: %v", err)
+				return nil, fmt.Errorf("failed to initialize empty manifest: %w", err)
 			}
 			return emptyManifest, nil
 		}
-		return nil, fmt.Errorf("failed to get manifest from ValKey: %v", err)
+		return nil, fmt.Errorf("failed to get manifest from ValKey: %w", err)
 	}
 
 	var manifest Manifest
 	err = json.Unmarshal([]byte(resp.Message.Value), &manifest)
 	if err != nil {
-		return nil, fmt.Errorf("failed to unmarshal manifest: %v", err)
+		return nil, fmt.Errorf("failed to unmarshal manifest: %w", err)
 	}
 
 	if manifest.Scripts == nil {
@@ -301,10 +303,10 @@ func (sm *SyncManager) getScriptContent(ctx context.Context, scriptName string) 
 	if err != nil {
 		if strings.Contains(err.Error(), "valkey nil message") {
 			// Script content doesn't exist in ValKey yet
-			log.Printf("No content found in ValKey for script %s", scriptName)
+			slog.Debug("no content found in ValKey for script", "script_id", scriptName)
 			return "", nil
 		}
-		return "", fmt.Errorf("failed to get script content from ValKey: %v", err)
+		return "", fmt.Errorf("failed to get script content from ValKey: %w", err)
 	}
 
 	return resp.Message.Value, nil
@@ -363,19 +365,19 @@ func (sm *SyncManager) syncScript(ctx context.Context, scriptName string, script
 	// Get script content from ValKey
 	globalContent, err := sm.getScriptContent(ctx, scriptName)
 	if err != nil {
-		return fmt.Errorf("failed to get script content from ValKey: %v", err)
+		return fmt.Errorf("failed to get script content from ValKey: %w", err)
 	}
 
 	// If script doesn't exist in ValKey, read from local and update ValKey
 	if globalContent == "" {
 		localContent, err := os.ReadFile(filepath.Join(sm.repoManager.BasePath, script.Path))
 		if err != nil {
-			return fmt.Errorf("failed to read local script: %v", err)
+			return fmt.Errorf("failed to read local script: %w", err)
 		}
 
 		err = sm.updateScriptContent(ctx, scriptName, &ScriptContent{Content: string(localContent)})
 		if err != nil {
-			return fmt.Errorf("failed to update script content in ValKey: %v", err)
+			return fmt.Errorf("failed to update script content in ValKey: %w", err)
 		}
 		return nil
 	}
@@ -383,7 +385,7 @@ func (sm *SyncManager) syncScript(ctx context.Context, scriptName string, script
 	// Update local script with ValKey content
 	err = os.WriteFile(filepath.Join(sm.repoManager.BasePath, script.Path), []byte(globalContent), 0644)
 	if err != nil {
-		return fmt.Errorf("failed to write script content: %v", err)
+		return fmt.Errorf("failed to write script content: %w", err)
 	}
 
 	return nil
