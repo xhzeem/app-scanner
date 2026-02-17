@@ -275,7 +275,18 @@ func (sm *ScanManager) submitHostWithSource(host sirius.Host, toolName string) e
 	}
 
 	url := fmt.Sprintf("%s/host/with-source", sm.apiBaseURL)
-	resp, err := http.Post(url, "application/json", bytes.NewBuffer(jsonData))
+	req, err := http.NewRequestWithContext(sm.ctx, http.MethodPost, url, bytes.NewBuffer(jsonData))
+	if err != nil {
+		return fmt.Errorf("failed to create request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	serviceKey := strings.TrimSpace(os.Getenv("SIRIUS_API_KEY"))
+	if serviceKey == "" {
+		return fmt.Errorf("SIRIUS_API_KEY is required for scanner API calls")
+	}
+	req.Header.Set("X-API-Key", serviceKey)
+
+	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		return fmt.Errorf("failed to submit host data: %w", err)
 	}

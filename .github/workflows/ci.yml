@@ -2,9 +2,9 @@ name: Go Submodule CI - app-scanner
 
 on:
   push:
-    branches: [ main ] # Or your default branch
+    branches: [main] # Or your default branch
   pull_request:
-    branches: [ main ] # Or your default branch
+    branches: [main] # Or your default branch
 
 jobs:
   test-and-lint:
@@ -17,7 +17,7 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version: '1.24'
+          go-version: "1.24"
           cache: true
 
       - name: Install Dependencies
@@ -39,4 +39,4 @@ jobs:
           token: ${{ secrets.MAIN_REPO_ACCESS_TOKEN }}
           repository: SiriusScan/Sirius
           event-type: submodule-update
-          client-payload: '{ "submodule": "${{ github.repository }}", "commit_sha": "${{ github.sha }}", "ref": "${{ github.ref }}" }' 
+          client-payload: '{ "submodule": "${{ github.repository }}", "commit_sha": "${{ github.sha }}", "ref": "${{ github.ref }}" }'
