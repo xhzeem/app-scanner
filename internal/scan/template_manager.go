@@ -362,17 +362,15 @@ func (tm *TemplateManager) InitializeSystemTemplates(ctx context.Context) error 
 		// Check if template already exists
 		existing, err := tm.GetTemplate(ctx, template.ID)
 		if err == nil && existing != nil {
-			// Update system templates when the new definition has agent_scan but the stored one doesn't.
-			// This handles the case where templates were seeded before agent scan support was added.
-			needsUpdate := false
-			if template.ScanOptions.AgentScan != nil && existing.ScanOptions.AgentScan == nil {
-				needsUpdate = true
-				slog.Debug("system template missing agent_scan config, updating", "template_id", template.ID)
-			}
+			needsUpdate, reasons := systemTemplateNeedsUpdate(existing, &template)
 			if !needsUpdate {
 				skipped++
 				continue
 			}
+
+			slog.Info("updating system template to canonical definition",
+				"template_id", template.ID,
+				"reasons", reasons)
 			// Overwrite with the canonical definition
 			if err := tm.UpdateTemplate(ctx, &template); err != nil {
 				slog.Warn("failed to update system template", "template_id", template.ID, "error", err)
@@ -390,6 +388,78 @@ func (tm *TemplateManager) InitializeSystemTemplates(ctx context.Context) error 
 
 	slog.Info("system templates initialized", "created", created, "updated", updated, "skipped", skipped)
 	return nil
+}
+
+func systemTemplateNeedsUpdate(existing *Template, canonical *Template) (bool, []string) {
+	reasons := make([]string, 0)
+
+	if existing.Name != canonical.Name {
+		reasons = append(reasons, "name")
+	}
+	if existing.Description != canonical.Description {
+		reasons = append(reasons, "description")
+	}
+	if existing.Type != canonical.Type {
+		reasons = append(reasons, "type")
+	}
+
+	if !equalStringSlice(existing.EnabledScripts, canonical.EnabledScripts) {
+		reasons = append(reasons, "enabled_scripts")
+	}
+	if !equalStringSlice(existing.ScanOptions.ScanTypes, canonical.ScanOptions.ScanTypes) {
+		reasons = append(reasons, "scan_options.scan_types")
+	}
+	if existing.ScanOptions.PortRange != canonical.ScanOptions.PortRange {
+		reasons = append(reasons, "scan_options.port_range")
+	}
+	if existing.ScanOptions.Aggressive != canonical.ScanOptions.Aggressive {
+		reasons = append(reasons, "scan_options.aggressive")
+	}
+	if existing.ScanOptions.MaxRetries != canonical.ScanOptions.MaxRetries {
+		reasons = append(reasons, "scan_options.max_retries")
+	}
+	if existing.ScanOptions.Parallel != canonical.ScanOptions.Parallel {
+		reasons = append(reasons, "scan_options.parallel")
+	}
+	if !equalStringSlice(existing.ScanOptions.ExcludePorts, canonical.ScanOptions.ExcludePorts) {
+		reasons = append(reasons, "scan_options.exclude_ports")
+	}
+	if !equalAgentScanConfig(existing.ScanOptions.AgentScan, canonical.ScanOptions.AgentScan) {
+		reasons = append(reasons, "scan_options.agent_scan")
+	}
+
+	return len(reasons) > 0, reasons
+}
+
+func equalStringSlice(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func equalAgentScanConfig(a, b *AgentScanConfig) bool {
+	if a == nil && b == nil {
+		return true
+	}
+	if a == nil || b == nil {
+		return false
+	}
+
+	if a.Enabled != b.Enabled ||
+		a.Mode != b.Mode ||
+		a.Timeout != b.Timeout ||
+		a.Concurrency != b.Concurrency {
+		return false
+	}
+
+	return equalStringSlice(a.AgentIDs, b.AgentIDs) &&
+		equalStringSlice(a.TemplateFilter, b.TemplateFilter)
 }
 
 // loadAllNSEScripts loads all NSE script IDs from the manifest

@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"net/http"
@@ -26,6 +27,7 @@ import (
 
 // Default number of worker goroutines
 const DEFAULT_WORKERS = 10
+const apiRequestTimeout = 15 * time.Second
 
 // TargetType represents the type of scan target
 type TargetType string
@@ -85,6 +87,7 @@ type ScanManager struct {
 	scanUpdater        *ScanUpdater
 	kvStore            store.KVStore
 	apiBaseURL         string         // API base URL for source-aware submissions
+	apiHTTPClient      *http.Client   // Shared HTTP client for API submissions
 	logger             *LoggingClient // Centralized logging client
 
 	// Cancellation support
@@ -132,6 +135,7 @@ func NewScanManager(kvStore store.KVStore, toolFactory *ScanToolFactory, updater
 		nseSync:         syncManager,
 		templateManager: templateManager,
 		apiBaseURL:      apiBaseURL,
+		apiHTTPClient:   &http.Client{Timeout: apiRequestTimeout},
 		logger:          NewLoggingClient(),
 		scanStrategies: map[string]ScanStrategy{
 			"nmap": &NmapStrategy{},
@@ -275,7 +279,10 @@ func (sm *ScanManager) submitHostWithSource(host sirius.Host, toolName string) e
 	}
 
 	url := fmt.Sprintf("%s/host/with-source", sm.apiBaseURL)
-	req, err := http.NewRequestWithContext(sm.ctx, http.MethodPost, url, bytes.NewBuffer(jsonData))
+	requestCtx, cancel := context.WithTimeout(sm.ctx, apiRequestTimeout)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(requestCtx, http.MethodPost, url, bytes.NewBuffer(jsonData))
 	if err != nil {
 		return fmt.Errorf("failed to create request: %w", err)
 	}
@@ -286,14 +293,15 @@ func (sm *ScanManager) submitHostWithSource(host sirius.Host, toolName string) e
 	}
 	req.Header.Set("X-API-Key", serviceKey)
 
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := sm.apiHTTPClient.Do(req)
 	if err != nil {
-		return fmt.Errorf("failed to submit host data: %w", err)
+		return fmt.Errorf("failed to submit host data to %s: %w", url, err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
-		return fmt.Errorf("API returned status %d", resp.StatusCode)
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		return fmt.Errorf("API returned status %d for %s: %s", resp.StatusCode, url, strings.TrimSpace(string(body)))
 	}
 
 	slog.Debug("Successfully submitted host with source", "host_ip", host.IP, "source_name", source.Name, "source_version", source.Version)
@@ -454,6 +462,23 @@ func (sm *ScanManager) processTarget(target Target) {
 	// Add each IP as a task to the worker pool
 	slog.Debug("Adding IPs to worker pool", "count", len(targetIPs), "scan_types", sm.currentScanOptions.ScanTypes, "port_range", sm.currentScanOptions.PortRange)
 
+	// Track expected work so scans can complete even when no hosts are ultimately discovered.
+	if err := sm.scanUpdater.Update(context.Background(), func(scan *store.ScanResult) error {
+		if netScan, ok := scan.SubScans["network"]; ok {
+			netScan.Progress.Total += len(targetIPs)
+			scan.SubScans["network"] = netScan
+		}
+		if scan.StartTime == "" {
+			scan.StartTime = time.Now().Format(time.RFC3339)
+		}
+		return nil
+	}); err != nil {
+		slog.Warn("Failed to update expected network target count",
+			"target", target.Value,
+			"count", len(targetIPs),
+			"error", err)
+	}
+
 	// Log scan started event (new event system)
 	sm.logger.LogScanStarted(sm.currentScanID, targetIPs, map[string]interface{}{
 		"scan_types":   sm.currentScanOptions.ScanTypes,
@@ -473,6 +498,15 @@ func (sm *ScanManager) processTarget(target Target) {
 
 // scanIP performs the actual scanning of a single IP using a sequential pipeline
 func (sm *ScanManager) scanIP(ctx context.Context, ip string) {
+	defer func() {
+		if ctx.Err() != nil {
+			return
+		}
+		if err := sm.markHostComplete(ip); err != nil {
+			slog.Warn("Failed to mark host completion", "ip", ip, "error", err)
+		}
+	}()
+
 	// Check for cancellation before starting
 	if ctx.Err() != nil {
 		slog.Debug("Cancelled before scanning", "ip", ip)
@@ -521,7 +555,10 @@ func (sm *ScanManager) scanIP(ctx context.Context, ip string) {
 
 			// Submit discovered host to API for real-time visibility
 			if err := sm.submitFingerprintResult(ip, result); err != nil {
-				slog.Warn("Failed to submit fingerprint data via API", "error", err)
+				slog.Warn("Failed to submit fingerprint data via API",
+					"scan_id", sm.currentScanID,
+					"ip", ip,
+					"error", err)
 				// Continue execution even if API submission fails
 			} else {
 				slog.Debug("Successfully submitted fingerprint discovery", "ip", ip)
@@ -540,7 +577,10 @@ func (sm *ScanManager) scanIP(ctx context.Context, ip string) {
 				}
 				return nil
 			}); err != nil {
-				slog.Warn("Failed to update KV store with fingerprint discovery", "error", err)
+				slog.Warn("Failed to update KV store with fingerprint discovery",
+					"scan_id", sm.currentScanID,
+					"ip", ip,
+					"error", err)
 			}
 
 			// Log host discovered event
@@ -623,10 +663,12 @@ func (sm *ScanManager) scanIP(ctx context.Context, ip string) {
 func (sm *ScanManager) markHostComplete(ip string) error {
 	return sm.scanUpdater.Update(context.Background(), func(scan *store.ScanResult) error {
 		scan.HostsCompleted++
+		totalExpected := 0
 
 		// Update network sub-scan progress
 		if netScan, ok := scan.SubScans["network"]; ok {
 			netScan.Progress.Completed = scan.HostsCompleted
+			totalExpected = netScan.Progress.Total
 			scan.SubScans["network"] = netScan
 		}
 
@@ -648,12 +690,19 @@ func (sm *ScanManager) markHostComplete(ip string) error {
 			}
 		}
 
-		// If all network hosts are processed, mark network sub-scan as complete
-		if scan.HostsCompleted >= networkHostCount && networkHostCount > 0 {
+		if totalExpected == 0 {
+			totalExpected = networkHostCount
+		}
+		if totalExpected < scan.HostsCompleted {
+			totalExpected = scan.HostsCompleted
+		}
+
+		// If all scheduled network targets are processed, mark network sub-scan as complete.
+		if scan.HostsCompleted >= totalExpected && totalExpected > 0 {
 			if netScan, ok := scan.SubScans["network"]; ok {
 				netScan.Status = "completed"
-				netScan.Progress.Total = networkHostCount
-				netScan.Progress.Completed = networkHostCount
+				netScan.Progress.Total = totalExpected
+				netScan.Progress.Completed = totalExpected
 				scan.SubScans["network"] = netScan
 			}
 
@@ -715,7 +764,10 @@ func (sm *ScanManager) runEnumeration(ctx context.Context, ip string) ([]int, er
 
 		// Submit host data using the new source-aware API
 		if err := sm.submitHostWithSource(enumResults, toolName); err != nil {
-			slog.Warn("Failed to submit enumeration data via source-aware API", "error", err)
+			slog.Warn("Failed to submit enumeration data via source-aware API",
+				"scan_id", sm.currentScanID,
+				"ip", ip,
+				"error", err)
 			slog.Debug("API may be unavailable or endpoint not implemented; continuing without database persistence")
 			// Continue execution even if database operations fail
 		} else {
@@ -738,6 +790,10 @@ func (sm *ScanManager) runEnumeration(ctx context.Context, ip string) ([]int, er
 			}
 			return nil
 		}); err != nil {
+			slog.Error("Failed to merge enumeration results into current scan state",
+				"scan_id", sm.currentScanID,
+				"ip", ip,
+				"error", err)
 			return nil, fmt.Errorf("failed to update scan with enumeration results for host %s: %w", ip, err)
 		}
 
@@ -867,11 +923,6 @@ func (sm *ScanManager) runVulnerabilityWithPorts(ctx context.Context, ip string,
 		return nil
 	}); err != nil {
 		return fmt.Errorf("failed to update scan with vulnerabilities for host %s: %w", vulnResults.IP, err)
-	}
-
-	// Only mark host complete after vulnerability scan
-	if err := sm.markHostComplete(ip); err != nil {
-		return fmt.Errorf("failed to mark host completion: %w", err)
 	}
 
 	slog.Debug("Successfully processed host with vulnerabilities using source-aware API", "ip", ip, "vulnerability_count", len(vulnResults.Vulnerabilities))
