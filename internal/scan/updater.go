@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"sync"
 
 	"github.com/SiriusScan/go-api/sirius/store"
 )
@@ -12,6 +13,7 @@ import (
 // ScanUpdater handles updates to the current scan in the KV store.
 type ScanUpdater struct {
 	kvStore store.KVStore
+	mu      sync.Mutex
 }
 
 // NewScanUpdater initializes a new ScanUpdater.
@@ -21,6 +23,9 @@ func NewScanUpdater(kv store.KVStore) *ScanUpdater {
 
 // Update retrieves the current scan, applies the modifier function, and writes it back.
 func (su *ScanUpdater) Update(ctx context.Context, modifier func(*store.ScanResult) error) error {
+	su.mu.Lock()
+	defer su.mu.Unlock()
+
 	val, err := su.kvStore.GetValue(ctx, "currentScan")
 	if err != nil {
 		return fmt.Errorf("error getting current scan: %w", err)
