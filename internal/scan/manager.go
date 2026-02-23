@@ -177,8 +177,11 @@ func (sm *ScanManager) detectScannerVersion(toolName string) string {
 			slog.Warn("Failed to detect naabu version", "error", err)
 		}
 		return "unknown"
+	case "ping++":
+		slog.Debug("ping++ is a library; no CLI version to detect")
+		return "embedded"
 	default:
-		slog.Warn("Unknown tool name for version detection", "tool_name", toolName)
+		slog.Debug("No version detection available for tool", "tool_name", toolName)
 		return "unknown"
 	}
 }
