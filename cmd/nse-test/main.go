@@ -13,33 +13,9 @@ import (
 )
 
 const (
-	// Base directory for NSE scripts in Docker
-	dockerNSEBase = "/opt/sirius/nse"
+	// Canonical base directory for NSE scripts in containerized environments.
+	dockerNSEBase = "/sirius-nse"
 )
-
-// Legacy directories to clean up (incorrect locations)
-var legacyDirs = []string{
-	"/opt/sirius-nse",
-}
-
-func ensureDirectory(path string) error {
-	fmt.Printf("🔧 Ensuring directory exists: %s\n", path)
-	if err := os.MkdirAll(path, 0755); err != nil {
-		return fmt.Errorf("failed to create directory %s: %w", path, err)
-	}
-	return nil
-}
-
-func cleanupLegacy() {
-	fmt.Printf("🧹 Cleaning up legacy NSE directories...\n")
-	for _, dir := range legacyDirs {
-		if err := os.RemoveAll(dir); err != nil {
-			fmt.Printf("⚠️  Warning: Failed to clean up legacy directory %s: %v\n", dir, err)
-		} else {
-			fmt.Printf("✨ Cleaned up legacy directory: %s\n", dir)
-		}
-	}
-}
 
 func loadRepositoryList() (*nse.RepositoryList, error) {
 	data, err := os.ReadFile("internal/nse/manifest.json")
@@ -58,11 +34,6 @@ func loadRepositoryList() (*nse.RepositoryList, error) {
 func main() {
 	fmt.Println("🚀 Starting NSE Test Program")
 	fmt.Printf("📌 Docker NSE Base Path: %s\n", dockerNSEBase)
-
-	// Clean up legacy directories
-	fmt.Println("🧹 Cleaning up legacy NSE directories...")
-	cleanupLegacy()
-	fmt.Println("🧹 Cleaned up main NSE directory for fresh test")
 
 	// Ensure NSE base directory exists
 	fmt.Printf("🔧 Ensuring directory exists: %s\n", dockerNSEBase)
@@ -152,6 +123,4 @@ func main() {
 	}
 
 	fmt.Println("\n✨ Test program completed")
-	fmt.Println("🧹 Cleaning up legacy NSE directories...")
-	cleanupLegacy()
 }

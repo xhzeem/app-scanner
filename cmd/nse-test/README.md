@@ -7,7 +7,6 @@ This tool verifies the NSE (Nmap Script Engine) initialization, repository manag
 The NSE Test executor performs the following functions:
 
 - Verifies proper directory structure for NSE scripts
-- Cleans up legacy NSE directories
 - Initializes and tests the ValKey connection
 - Loads the repository list from manifest
 - Ensures NSE script repositories are cloned and up-to-date
@@ -41,8 +40,7 @@ go build -o bin/nse-test cmd/nse-test/main.go
 
 The test executor uses these directories:
 
-- Docker NSE Base: `/opt/sirius/nse`
-- Legacy directories (cleaned up): `/opt/sirius-nse` and others
+- Docker NSE Base: `/sirius-nse`
 - Repository manifest: `/app-scanner/internal/nse/manifest.json`
 
 ## Output
@@ -50,7 +48,6 @@ The test executor uses these directories:
 The test provides detailed feedback with emojis for better visibility:
 
 - 🚀 - Starting test program
-- 🧹 - Cleaning legacy directories
 - 🔌 - Connecting to ValKey
 - 🔄 - Processing repositories
 - ✅ - Successful operations
@@ -69,7 +66,7 @@ Common issues and solutions:
 
    - Ensure git is installed in the container
    - Check network connectivity for git cloning
-   - Verify directory permissions in `/opt/sirius/nse`
+   - Verify directory permissions in `/sirius-nse`
 
 3. **Script Sync Failures**:
    - Check ValKey connectivity and permissions

@@ -7,14 +7,13 @@ import (
 	"fmt"
 	"log"
 	"os"
-	"path/filepath"
 
 	"github.com/SiriusScan/app-scanner/internal/nse"
 	"github.com/SiriusScan/go-api/sirius/store"
 )
 
 const (
-	dockerNSEBase = "/opt/sirius/nse"
+	dockerNSEBase = "/sirius-nse"
 )
 
 func main() {
@@ -46,7 +45,7 @@ func main() {
 		}
 
 		// Create sync manager
-		repoPath := filepath.Join(dockerNSEBase, "sirius-nse")
+		repoPath := dockerNSEBase
 		repoManager := nse.NewRepoManager(repoPath, nse.NSERepoURL)
 		syncManager := nse.NewSyncManager(repoManager, kvStore)
 
@@ -75,7 +74,7 @@ func main() {
 	// Process each repository
 	for _, repo := range repoList.Repositories {
 		fmt.Printf("\n🔄 Processing repository: %s\n", repo.Name)
-		repoPath := filepath.Join(dockerNSEBase, repo.Name)
+		repoPath := dockerNSEBase
 
 		// Create repo manager
 		repoManager := nse.NewRepoManager(repoPath, repo.URL)

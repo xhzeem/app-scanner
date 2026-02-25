@@ -6,6 +6,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -14,12 +15,20 @@ import (
 
 var errNotFound = errors.New("key not found")
 
-// mockKVStore implements store.KVStore for testing
-type mockKVStore struct {
+// inMemoryKVStore is an interface-complete KVStore implementation for tests.
+type inMemoryKVStore struct {
 	data map[string]string
+	ttl  map[string]int
 }
 
-func (m *mockKVStore) GetValue(ctx context.Context, key string) (store.ValkeyResponse, error) {
+func newInMemoryKVStore() *inMemoryKVStore {
+	return &inMemoryKVStore{
+		data: make(map[string]string),
+		ttl:  make(map[string]int),
+	}
+}
+
+func (m *inMemoryKVStore) GetValue(ctx context.Context, key string) (store.ValkeyResponse, error) {
 	if val, ok := m.data[key]; ok {
 		return store.ValkeyResponse{
 			Message: store.ValkeyValue{Value: val},
@@ -29,57 +38,105 @@ func (m *mockKVStore) GetValue(ctx context.Context, key string) (store.ValkeyRes
 	return store.ValkeyResponse{}, errNotFound
 }
 
-func (m *mockKVStore) SetValue(ctx context.Context, key string, value string) error {
+func (m *inMemoryKVStore) SetValue(ctx context.Context, key string, value string) error {
 	m.data[key] = value
 	return nil
 }
 
-func (m *mockKVStore) Close() error {
+func (m *inMemoryKVStore) SetValueWithTTL(ctx context.Context, key, value string, ttlSeconds int) error {
+	m.data[key] = value
+	m.ttl[key] = ttlSeconds
 	return nil
 }
 
-// mockGitOps implements GitOperations for testing
-type mockGitOps struct {
-	cloneCalled bool
-	fetchCalled bool
-	resetCalled bool
-	shouldFail  bool
-}
-
-func (m *mockGitOps) Clone(repoURL, targetPath string) error {
-	m.cloneCalled = true
-	if m.shouldFail {
-		return errors.New("mock clone failure")
+func (m *inMemoryKVStore) GetTTL(ctx context.Context, key string) (int, error) {
+	if ttl, ok := m.ttl[key]; ok {
+		return ttl, nil
 	}
-	return nil
+	return -1, nil
 }
 
-func (m *mockGitOps) Fetch(repoPath string) error {
-	m.fetchCalled = true
-	if m.shouldFail {
-		return errors.New("mock fetch failure")
+func (m *inMemoryKVStore) SetExpire(ctx context.Context, key string, ttlSeconds int) error {
+	if _, ok := m.data[key]; !ok {
+		return errNotFound
 	}
+	m.ttl[key] = ttlSeconds
 	return nil
 }
 
-func (m *mockGitOps) Reset(repoPath string) error {
-	m.resetCalled = true
-	if m.shouldFail {
-		return errors.New("mock reset failure")
+func (m *inMemoryKVStore) ListKeys(ctx context.Context, pattern string) ([]string, error) {
+	keys := make([]string, 0)
+	if pattern == "*" {
+		for key := range m.data {
+			keys = append(keys, key)
+		}
+		return keys, nil
 	}
+
+	prefix := strings.TrimSuffix(pattern, "*")
+	for key := range m.data {
+		if strings.HasPrefix(key, prefix) {
+			keys = append(keys, key)
+		}
+	}
+	return keys, nil
+}
+
+func (m *inMemoryKVStore) DeleteValue(ctx context.Context, key string) error {
+	delete(m.data, key)
+	delete(m.ttl, key)
 	return nil
 }
 
-func TestNSEIntegration(t *testing.T) {
-	// Create temporary directories for testing
+func (m *inMemoryKVStore) Close() error {
+	return nil
+}
+
+func TestNSESyncAndUpdate(t *testing.T) {
 	tmpDir, err := os.MkdirTemp("", "nse-test-*")
 	if err != nil {
-		t.Fatalf("Failed to create temp directory: %v", err)
+		t.Fatalf("failed to create temp directory: %v", err)
 	}
 	defer os.RemoveAll(tmpDir)
 
-	// Create a test manifest file
-	manifestContent := RepositoryList{
+	repoRoot := filepath.Join(tmpDir, "sirius-nse")
+	scriptDir := filepath.Join(repoRoot, "scripts")
+	gitDir := filepath.Join(repoRoot, ".git")
+	if err := os.MkdirAll(scriptDir, 0755); err != nil {
+		t.Fatalf("failed to create script directory: %v", err)
+	}
+	if err := os.MkdirAll(gitDir, 0755); err != nil {
+		t.Fatalf("failed to create .git directory: %v", err)
+	}
+
+	scriptID := "vulners"
+	scriptPath := "scripts/vulners.nse"
+	initialScript := "-- initial test script content"
+	if err := os.WriteFile(filepath.Join(repoRoot, scriptPath), []byte(initialScript), 0644); err != nil {
+		t.Fatalf("failed to write test script: %v", err)
+	}
+
+	manifest := Manifest{
+		Name:        "sirius-nse",
+		Version:     "0.1.0",
+		Description: "test manifest",
+		Scripts: map[string]Script{
+			scriptID: {
+				Name:     "vulners",
+				Path:     scriptPath,
+				Protocol: "*",
+			},
+		},
+	}
+	manifestData, err := json.Marshal(manifest)
+	if err != nil {
+		t.Fatalf("failed to marshal manifest: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(repoRoot, ManifestFile), manifestData, 0644); err != nil {
+		t.Fatalf("failed to write manifest file: %v", err)
+	}
+
+	builtInRepoList := RepositoryList{
 		Repositories: []Repository{
 			{
 				Name: "sirius-nse",
@@ -87,144 +144,60 @@ func TestNSEIntegration(t *testing.T) {
 			},
 		},
 	}
-	manifestData, err := json.Marshal(manifestContent)
+	repoListData, err := json.Marshal(builtInRepoList)
 	if err != nil {
-		t.Fatalf("Failed to marshal manifest: %v", err)
-	}
-	manifestPath := filepath.Join(tmpDir, "manifest.json")
-	if err := os.WriteFile(manifestPath, manifestData, 0644); err != nil {
-		t.Fatalf("Failed to write manifest file: %v", err)
+		t.Fatalf("failed to marshal repository list: %v", err)
 	}
 
-	// Create mock KV store
-	kvStore := &mockKVStore{
-		data: make(map[string]string),
+	kvStore := newInMemoryKVStore()
+	ctx := context.Background()
+	if err := kvStore.SetValue(ctx, ValKeyRepoManifestKey, string(repoListData)); err != nil {
+		t.Fatalf("failed to preload repository list: %v", err)
 	}
 
-	// Create mock Git operations
-	mockGit := &mockGitOps{}
-
-	// Create repo manager with mock Git ops
-	repoManager := NewRepoManager(filepath.Join(tmpDir, "sirius-nse"), manifestContent.Repositories[0].URL)
-	repoManager.SetGitOps(mockGit)
-
-	// Create sync manager
+	repoManager := NewRepoManager(repoRoot, "https://github.com/SiriusScan/sirius-nse.git")
 	syncManager := NewSyncManager(repoManager, kvStore)
 
-	// Test repository setup
-	t.Run("Repository Setup", func(t *testing.T) {
-		if err := repoManager.EnsureRepo(); err != nil {
-			t.Errorf("Failed to ensure repository: %v", err)
-		}
-
-		if !mockGit.cloneCalled {
-			t.Error("Clone was not called")
-		}
-	})
-
-	// Test repository update
-	t.Run("Repository Update", func(t *testing.T) {
-		// Reset mock
-		mockGit.cloneCalled = false
-		mockGit.fetchCalled = false
-		mockGit.resetCalled = false
-
-		// Create .git directory to simulate existing repo
-		gitDir := filepath.Join(tmpDir, "sirius-nse", ".git")
-		if err := os.MkdirAll(gitDir, 0755); err != nil {
-			t.Fatalf("Failed to create .git directory: %v", err)
-		}
-
-		if err := repoManager.EnsureRepo(); err != nil {
-			t.Errorf("Failed to update repository: %v", err)
-		}
-
-		if mockGit.cloneCalled {
-			t.Error("Clone was called for existing repository")
-		}
-		if !mockGit.fetchCalled {
-			t.Error("Fetch was not called")
-		}
-		if !mockGit.resetCalled {
-			t.Error("Reset was not called")
-		}
-	})
-
-	// Test error handling
-	t.Run("Error Handling", func(t *testing.T) {
-		// Reset mock and set it to fail
-		mockGit.shouldFail = true
-		mockGit.cloneCalled = false
-		mockGit.fetchCalled = false
-		mockGit.resetCalled = false
-
-		if err := repoManager.EnsureRepo(); err == nil {
-			t.Error("Expected error, got nil")
-		}
-	})
-
-	// Test ValKey synchronization
-	t.Run("ValKey Sync", func(t *testing.T) {
-		ctx := context.Background()
-
-		// Sync should work even when ValKey is empty
+	t.Run("Sync writes canonical manifest and script content", func(t *testing.T) {
 		if err := syncManager.Sync(ctx); err != nil {
-			t.Fatalf("Failed initial sync: %v", err)
+			t.Fatalf("sync failed: %v", err)
 		}
 
-		// Verify manifest was stored in ValKey
-		resp, err := kvStore.GetValue(ctx, ValKeyManifestKey)
+		manifestResp, err := kvStore.GetValue(ctx, ValKeyManifestKey)
 		if err != nil {
-			t.Fatalf("Failed to get manifest from ValKey: %v", err)
+			t.Fatalf("failed to read manifest from kv store: %v", err)
 		}
 
-		var storedManifest Manifest
-		if err := json.Unmarshal([]byte(resp.Message.Value), &storedManifest); err != nil {
-			t.Fatalf("Failed to unmarshal stored manifest: %v", err)
+		var persisted Manifest
+		if err := json.Unmarshal([]byte(manifestResp.Message.Value), &persisted); err != nil {
+			t.Fatalf("failed to unmarshal persisted manifest: %v", err)
 		}
 
-		if storedManifest.Name != "sirius-nse" {
-			t.Errorf("Expected stored manifest name 'sirius-nse', got %s", storedManifest.Name)
+		if persisted.Name != manifest.Name {
+			t.Fatalf("unexpected manifest name: got %q want %q", persisted.Name, manifest.Name)
 		}
 
-		// Verify script content was stored
-		manifest, _ := repoManager.GetManifest()
-		for id, script := range manifest.Scripts {
-			resp, err := kvStore.GetValue(ctx, ValKeyScriptPrefix+id)
-			if err != nil {
-				t.Errorf("Failed to get script content for %s: %v", id, err)
-				continue
-			}
+		contentResp, err := kvStore.GetValue(ctx, ValKeyScriptPrefix+scriptID)
+		if err != nil {
+			t.Fatalf("failed to read script content from kv store: %v", err)
+		}
 
-			var content ScriptContent
-			if err := json.Unmarshal([]byte(resp.Message.Value), &content); err != nil {
-				t.Errorf("Failed to unmarshal script content for %s: %v", id, err)
-				continue
-			}
+		var persistedContent ScriptContent
+		if err := json.Unmarshal([]byte(contentResp.Message.Value), &persistedContent); err != nil {
+			t.Fatalf("failed to unmarshal persisted script content: %v", err)
+		}
 
-			// Verify metadata was set correctly
-			if content.Metadata.Author != "Unknown" {
-				t.Errorf("Expected default author 'Unknown', got %s", content.Metadata.Author)
-			}
-			if !contains(content.Metadata.Tags, script.Protocol) {
-				t.Errorf("Expected protocol %s in tags, got %v", script.Protocol, content.Metadata.Tags)
-			}
+		if persistedContent.Content != initialScript {
+			t.Fatalf("unexpected script content: got %q want %q", persistedContent.Content, initialScript)
+		}
+		if persistedContent.Metadata.Author != "System" {
+			t.Fatalf("unexpected default author: got %q want %q", persistedContent.Metadata.Author, "System")
 		}
 	})
 
-	// Test script content updates
-	t.Run("Script Content Updates", func(t *testing.T) {
-		ctx := context.Background()
-		manifest, _ := repoManager.GetManifest()
-		scriptID := "vulners"
-		script, exists := manifest.Scripts[scriptID]
-		if !exists {
-			t.Fatal("Vulners script not found in manifest")
-		}
-
-		// Update script content via UI
-		newContent := &ScriptContent{
-			Content: "-- Updated test content",
+	t.Run("UpdateScriptFromUI updates kv store and local file", func(t *testing.T) {
+		updated := &ScriptContent{
+			Content: "-- updated test content",
 			Metadata: Metadata{
 				Author:      "Test Author",
 				Tags:        []string{"test", "updated"},
@@ -233,47 +206,34 @@ func TestNSEIntegration(t *testing.T) {
 			UpdatedAt: time.Now().Unix(),
 		}
 
-		if err := syncManager.UpdateScriptFromUI(ctx, scriptID, newContent); err != nil {
-			t.Fatalf("Failed to update script content: %v", err)
+		if err := syncManager.UpdateScriptFromUI(ctx, scriptID, updated); err != nil {
+			t.Fatalf("update script from ui failed: %v", err)
 		}
 
-		// Verify content was updated in ValKey
-		resp, err := kvStore.GetValue(ctx, ValKeyScriptPrefix+scriptID)
+		contentResp, err := kvStore.GetValue(ctx, ValKeyScriptPrefix+scriptID)
 		if err != nil {
-			t.Fatalf("Failed to get updated script content: %v", err)
+			t.Fatalf("failed to read updated script content from kv store: %v", err)
 		}
 
-		var storedContent ScriptContent
-		if err := json.Unmarshal([]byte(resp.Message.Value), &storedContent); err != nil {
-			t.Fatalf("Failed to unmarshal updated script content: %v", err)
+		var persistedContent ScriptContent
+		if err := json.Unmarshal([]byte(contentResp.Message.Value), &persistedContent); err != nil {
+			t.Fatalf("failed to unmarshal updated script content: %v", err)
 		}
 
-		if storedContent.Content != newContent.Content {
-			t.Error("Script content was not updated correctly")
+		if persistedContent.Content != updated.Content {
+			t.Fatalf("unexpected updated script content: got %q want %q", persistedContent.Content, updated.Content)
 		}
-		if storedContent.Metadata.Author != newContent.Metadata.Author {
-			t.Error("Script metadata was not updated correctly")
+		if persistedContent.Metadata.Author != updated.Metadata.Author {
+			t.Fatalf("unexpected updated author: got %q want %q", persistedContent.Metadata.Author, updated.Metadata.Author)
 		}
 
-		// Verify content was updated in local file
-		localPath := filepath.Join(NSEBasePath, script.Path)
-		localContent, err := os.ReadFile(localPath)
+		localContent, err := os.ReadFile(filepath.Join(repoRoot, scriptPath))
 		if err != nil {
-			t.Fatalf("Failed to read local script file: %v", err)
+			t.Fatalf("failed to read updated local script: %v", err)
 		}
 
-		if string(localContent) != newContent.Content {
-			t.Error("Local script file was not updated correctly")
+		if string(localContent) != updated.Content {
+			t.Fatalf("unexpected local script content: got %q want %q", string(localContent), updated.Content)
 		}
 	})
-}
-
-// Helper function to check if a slice contains a string
-func contains(slice []string, str string) bool {
-	for _, s := range slice {
-		if s == str {
-			return true
-		}
-	}
-	return false
 }

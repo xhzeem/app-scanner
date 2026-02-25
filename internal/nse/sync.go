@@ -1,9 +1,8 @@
 package nse
 
-// Modify to use the new manifest.json file and sync with the repo and valkey
-
 import (
 	"context"
+	_ "embed"
 	"encoding/json"
 	"fmt"
 	"log/slog"
@@ -18,6 +17,11 @@ import (
 const (
 	scriptContentPrefix = "nse:script"
 )
+
+// builtInRepositoryManifest stores the default repository manifest independent of process CWD.
+//
+//go:embed manifest.json
+var builtInRepositoryManifest []byte
 
 // SyncManager handles synchronization between local NSE scripts and ValKey store
 type SyncManager struct {
@@ -42,7 +46,7 @@ func (sm *SyncManager) loadRepositories(ctx context.Context) (*RepositoryList, e
 		if strings.Contains(err.Error(), "valkey nil message") || strings.Contains(err.Error(), "not found") {
 			// Load built-in repository list
 			slog.Info("no repository manifest found in ValKey, loading built-in manifest")
-			builtInList, err := LoadRepositoryList("internal/nse/manifest.json")
+			builtInList, err := sm.loadBuiltInRepositoryList()
 			if err != nil {
 				return nil, fmt.Errorf("failed to load built-in repository list: %w", err)
 			}
@@ -72,7 +76,16 @@ func (sm *SyncManager) loadRepositories(ctx context.Context) (*RepositoryList, e
 	return &repoList, nil
 }
 
-// Sync synchronizes the local NSE scripts with the ValKey store
+func (sm *SyncManager) loadBuiltInRepositoryList() (*RepositoryList, error) {
+	var repoList RepositoryList
+	if err := json.Unmarshal(builtInRepositoryManifest, &repoList); err != nil {
+		return nil, fmt.Errorf("failed to parse embedded repository list: %w", err)
+	}
+	return &repoList, nil
+}
+
+// Sync synchronizes the local NSE scripts with the ValKey store.
+// Hard-cut behavior: the scanner only accepts a canonical local git repository state.
 func (sm *SyncManager) Sync(ctx context.Context) error {
 	// Load repositories from ValKey or initialize from built-in list
 	repoList, err := sm.loadRepositories(ctx)
@@ -87,57 +100,36 @@ func (sm *SyncManager) Sync(ctx context.Context) error {
 		// Create a new repo manager for this repository
 		repoPath := filepath.Join(sm.repoManager.BasePath, "..", repo.Name)
 		repoManager := NewRepoManager(repoPath, repo.URL)
+		manifestPath := filepath.Join(repoPath, ManifestFile)
 
-		// Check if repository already exists and has a manifest (development/volume mount scenario)
-		if repoManager.isGitRepo() {
-			slog.Debug("repository already exists, using local copy", "repo", repo.Name)
-		} else {
-			// Ensure repository is cloned (production scenario)
-			if err := repoManager.EnsureRepo(); err != nil {
-				slog.Warn("failed to ensure repository", "repo", repo.Name, "error", err)
-				continue
+		// Hard-cut: require canonical git repository layout at the configured path.
+		if !repoManager.isGitRepo() {
+			return fmt.Errorf("repository %q is not a git repository at %q", repo.Name, repoPath)
+		}
+
+		// Ensure a manifest exists in the canonical repository before continuing.
+		if _, err := os.Stat(manifestPath); err != nil {
+			if os.IsNotExist(err) {
+				return fmt.Errorf("repository manifest not found for %q at %q", repo.Name, manifestPath)
 			}
+			return fmt.Errorf("failed to check repository manifest for %q at %q: %w", repo.Name, manifestPath, err)
 		}
 
 		// Get local manifest from repository
 		localManifest, err := repoManager.GetManifest()
 		if err != nil {
-			slog.Warn("failed to get manifest from repository", "repo", repo.Name, "error", err)
-			continue
+			return fmt.Errorf("failed to get manifest from repository %q: %w", repo.Name, err)
 		}
 
-		// Get ValKey manifest (global source of truth)
-		globalManifest, err := sm.getValKeyManifest(ctx)
-		if err != nil {
-			// Check for key not found errors
-			if strings.Contains(err.Error(), "not found") {
-				// If no global manifest exists, initialize it with local manifest
-				slog.Info("no manifest found in ValKey, initializing with local manifest", "manifest", localManifest.Name)
-				if err := sm.updateValKeyManifest(ctx, localManifest); err != nil {
-					slog.Warn("failed to initialize ValKey manifest", "repo", repo.Name, "error", err)
-					continue
-				}
-				slog.Info("successfully initialized ValKey manifest")
-				globalManifest = localManifest
-			} else {
-				slog.Warn("failed to get ValKey manifest", "repo", repo.Name, "error", err)
-				continue
-			}
+		// Persist local manifest as the canonical manifest in ValKey.
+		if err := sm.updateValKeyManifest(ctx, localManifest); err != nil {
+			return fmt.Errorf("failed to update ValKey manifest for %q: %w", repo.Name, err)
 		}
 
-		// Merge manifests with global taking precedence
-		mergedManifest := sm.mergeManifests(globalManifest, localManifest)
-
-		// Update ValKey with merged manifest
-		if err := sm.updateValKeyManifest(ctx, mergedManifest); err != nil {
-			slog.Warn("failed to update ValKey manifest", "repo", repo.Name, "error", err)
-			continue
-		}
-
-		// Sync each script's content
+		// Sync each script's content.
 		var synced, failed int
-		for id, script := range mergedManifest.Scripts {
-			if err := sm.syncScriptContent(id, script); err != nil {
+		for id, script := range localManifest.Scripts {
+			if err := sm.syncScriptContent(repoManager.BasePath, id, script); err != nil {
 				failed++
 				slog.Debug("failed to sync script", "script_id", id, "error", err)
 				continue
@@ -145,39 +137,10 @@ func (sm *SyncManager) Sync(ctx context.Context) error {
 			synced++
 		}
 		slog.Info("script sync complete", "repo", repo.Name,
-			"synced", synced, "failed", failed, "total", len(mergedManifest.Scripts))
+			"synced", synced, "failed", failed, "total", len(localManifest.Scripts))
 	}
 
 	return nil
-}
-
-// mergeManifests merges two manifests with global taking precedence
-// But ensures new scripts from local are added to the merged result
-func (sm *SyncManager) mergeManifests(global, local *Manifest) *Manifest {
-	slog.Debug("merging manifests", "global_scripts", len(global.Scripts), "local_scripts", len(local.Scripts))
-
-	merged := &Manifest{
-		Name:        global.Name,        // Use global name
-		Version:     global.Version,     // Use global version
-		Description: global.Description, // Use global description
-		Scripts:     make(map[string]Script),
-	}
-
-	// First, add all local scripts
-	for id, script := range local.Scripts {
-		merged.Scripts[id] = script
-		if _, exists := global.Scripts[id]; !exists {
-			slog.Debug("found new script in repository", "script_id", id)
-		}
-	}
-
-	// Then overlay global scripts (taking precedence for existing scripts)
-	for id, script := range global.Scripts {
-		merged.Scripts[id] = script
-	}
-
-	slog.Debug("merged manifest complete", "script_count", len(merged.Scripts))
-	return merged
 }
 
 // extractScriptContent ensures we're storing proper Lua script content, not JSON
@@ -199,7 +162,7 @@ func extractScriptContent(content string) string {
 }
 
 // syncScriptContent synchronizes a single script's content
-func (sm *SyncManager) syncScriptContent(id string, script Script) error {
+func (sm *SyncManager) syncScriptContent(repoBasePath, id string, script Script) error {
 	// Get script content from ValKey first (highest priority)
 	globalContent, err := sm.getScriptContent(context.Background(), id)
 	if err != nil && !strings.Contains(err.Error(), "not found") {
@@ -212,7 +175,7 @@ func (sm *SyncManager) syncScriptContent(id string, script Script) error {
 		scriptContent := extractScriptContent(globalContent)
 
 		// Write global content to local file
-		scriptPath := filepath.Join(sm.repoManager.BasePath, script.Path)
+		scriptPath := filepath.Join(repoBasePath, script.Path)
 		if err := os.MkdirAll(filepath.Dir(scriptPath), 0755); err != nil {
 			return fmt.Errorf("failed to create script directory: %w", err)
 		}
@@ -224,7 +187,7 @@ func (sm *SyncManager) syncScriptContent(id string, script Script) error {
 	}
 
 	// If no global content, read from local file
-	scriptPath := filepath.Join(sm.repoManager.BasePath, script.Path)
+	scriptPath := filepath.Join(repoBasePath, script.Path)
 	localContent, err := os.ReadFile(scriptPath)
 	if err != nil {
 		return fmt.Errorf("failed to read local script: %w", err)
@@ -247,38 +210,6 @@ func (sm *SyncManager) syncScriptContent(id string, script Script) error {
 	}
 
 	return nil
-}
-
-// getValKeyManifest retrieves the manifest from ValKey store
-func (sm *SyncManager) getValKeyManifest(ctx context.Context) (*Manifest, error) {
-	resp, err := sm.kvStore.GetValue(ctx, ValKeyManifestKey)
-	if err != nil {
-		if strings.Contains(err.Error(), "valkey nil message") {
-			// Initialize empty manifest if it doesn't exist
-			slog.Info("no manifest found in ValKey, initializing empty manifest")
-			emptyManifest := &Manifest{
-				Scripts: make(map[string]Script),
-			}
-			err = sm.updateValKeyManifest(ctx, emptyManifest)
-			if err != nil {
-				return nil, fmt.Errorf("failed to initialize empty manifest: %w", err)
-			}
-			return emptyManifest, nil
-		}
-		return nil, fmt.Errorf("failed to get manifest from ValKey: %w", err)
-	}
-
-	var manifest Manifest
-	err = json.Unmarshal([]byte(resp.Message.Value), &manifest)
-	if err != nil {
-		return nil, fmt.Errorf("failed to unmarshal manifest: %w", err)
-	}
-
-	if manifest.Scripts == nil {
-		manifest.Scripts = make(map[string]Script)
-	}
-
-	return &manifest, nil
 }
 
 // updateValKeyManifest updates the manifest in ValKey store
@@ -349,7 +280,7 @@ func (sm *SyncManager) UpdateScriptFromUI(ctx context.Context, scriptID string, 
 	}
 
 	// Create script directory and write the updated content to the local file
-	scriptPath := filepath.Join(NSEBasePath, script.Path)
+	scriptPath := filepath.Join(sm.repoManager.BasePath, script.Path)
 	if err := os.MkdirAll(filepath.Dir(scriptPath), 0755); err != nil {
 		return fmt.Errorf("failed to create script directory: %w", err)
 	}
@@ -361,39 +292,9 @@ func (sm *SyncManager) UpdateScriptFromUI(ctx context.Context, scriptID string, 
 	return nil
 }
 
-func (sm *SyncManager) syncScript(ctx context.Context, scriptName string, script Script) error {
-	// Get script content from ValKey
-	globalContent, err := sm.getScriptContent(ctx, scriptName)
-	if err != nil {
-		return fmt.Errorf("failed to get script content from ValKey: %w", err)
-	}
-
-	// If script doesn't exist in ValKey, read from local and update ValKey
-	if globalContent == "" {
-		localContent, err := os.ReadFile(filepath.Join(sm.repoManager.BasePath, script.Path))
-		if err != nil {
-			return fmt.Errorf("failed to read local script: %w", err)
-		}
-
-		err = sm.updateScriptContent(ctx, scriptName, &ScriptContent{Content: string(localContent)})
-		if err != nil {
-			return fmt.Errorf("failed to update script content in ValKey: %w", err)
-		}
-		return nil
-	}
-
-	// Update local script with ValKey content
-	err = os.WriteFile(filepath.Join(sm.repoManager.BasePath, script.Path), []byte(globalContent), 0644)
-	if err != nil {
-		return fmt.Errorf("failed to write script content: %w", err)
-	}
-
-	return nil
-}
-
 // SyncScriptContent synchronizes a single script's content
 func (sm *SyncManager) SyncScriptContent(id string, script Script) error {
-	return sm.syncScriptContent(id, script)
+	return sm.syncScriptContent(sm.repoManager.BasePath, id, script)
 }
 
 // UpdateValKeyManifest updates the manifest in ValKey store

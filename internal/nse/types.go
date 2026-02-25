@@ -13,7 +13,7 @@ const (
 	DefaultNSERepoURL = "https://github.com/SiriusScan/sirius-nse.git"
 	// DefaultNSEBasePath is the default base path where NSE scripts are stored.
 	// Override with the NSE_BASE_PATH environment variable.
-	DefaultNSEBasePath = "/opt/sirius-nse"
+	DefaultNSEBasePath = "/sirius-nse"
 	// ManifestFile is the name of the manifest file
 	ManifestFile = "manifest.json"
 	// ValKeyManifestKey is the key used to store the manifest in ValKey

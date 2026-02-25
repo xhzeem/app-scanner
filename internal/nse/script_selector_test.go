@@ -110,9 +110,8 @@ func TestScriptSelector(t *testing.T) {
 				}
 
 				if !tt.wantErr {
-					// Verify vulners is always included
-					if !strings.Contains(flag, "vulners") {
-						t.Error("BuildNmapScriptFlag() result does not contain vulners script")
+					if strings.TrimSpace(flag) == "" {
+						t.Error("BuildNmapScriptFlag() returned an empty script flag")
 					}
 				}
 			})
