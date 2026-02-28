@@ -710,14 +710,22 @@ func (sm *ScanManager) scanIP(ctx context.Context, ip string) {
 						// Check if vuln already exists to avoid duplicates
 						exists := false
 						for _, v := range scan.Vulnerabilities {
-							if v.VID == vuln.VID && v.IP == ip {
+							if v.ID == vuln.VID && v.HostID == ip {
 								exists = true
 								break
 							}
 						}
 						if !exists {
-							vuln.IP = ip // Ensure IP is set on vulnerability
-							scan.Vulnerabilities = append(scan.Vulnerabilities, vuln)
+							severity := calculateSeverity(vuln.RiskScore)
+							scan.Vulnerabilities = append(scan.Vulnerabilities, store.VulnerabilitySummary{
+								ID:          vuln.VID,
+								Severity:    severity,
+								Title:       vuln.Title,
+								Description: vuln.Description,
+								RiskScore:   vuln.RiskScore,
+								ScanSource:  "nuclei",
+								HostID:      ip,
+							})
 						}
 					}
 					return nil
