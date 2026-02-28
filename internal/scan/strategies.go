@@ -9,6 +9,7 @@ import (
 
 	"github.com/SiriusScan/app-scanner/modules/naabu"
 	"github.com/SiriusScan/app-scanner/modules/nmap"
+	"github.com/SiriusScan/app-scanner/modules/nuclei"
 	"github.com/SiriusScan/go-api/nvd"
 	"github.com/SiriusScan/go-api/sirius"
 )
@@ -216,4 +217,57 @@ type FingerprintStrategy interface {
 	Fingerprint(target string) (FingerprintResult, error)
 	// FingerprintWithContext performs fingerprinting with cancellation support
 	FingerprintWithContext(ctx context.Context, target string) (FingerprintResult, error)
+}
+
+// NucleiStrategy implements vulnerability scanning using Nuclei.
+type NucleiStrategy struct {
+	Templates        []string
+	Tags             []string
+	Severities       []string
+	RateLimit        int
+	Concurrency      int
+	BulkSize         int
+	InteractshServer string
+	Fuzzing          bool
+	FollowRedirects  bool
+}
+
+// Execute performs the vulnerability scan using Nuclei.
+func (n *NucleiStrategy) Execute(target string) (sirius.Host, error) {
+	return n.ExecuteWithContext(context.Background(), target)
+}
+
+// ExecuteWithContext performs the Nuclei scan with cancellation support.
+func (n *NucleiStrategy) ExecuteWithContext(ctx context.Context, target string) (sirius.Host, error) {
+	slog.Info("starting nuclei vulnerability scan", "target", target)
+
+	if ctx.Err() != nil {
+		return sirius.Host{}, fmt.Errorf("scan cancelled before starting")
+	}
+
+	config := nuclei.ScanConfig{
+		Target:           target,
+		Templates:        n.Templates,
+		Tags:             n.Tags,
+		Severities:       n.Severities,
+		RateLimit:        n.RateLimit,
+		Concurrency:      n.Concurrency,
+		BulkSize:         n.BulkSize,
+		InteractshServer: n.InteractshServer,
+		Fuzzing:          n.Fuzzing,
+		FollowRedirects:  n.FollowRedirects,
+		Ctx:              ctx,
+	}
+
+	results, err := nuclei.ScanWithConfig(config)
+	if err != nil {
+		return sirius.Host{}, err
+	}
+
+	if ctx.Err() != nil {
+		return sirius.Host{}, fmt.Errorf("scan cancelled")
+	}
+
+	slog.Info("nuclei scan complete", "target", target, "vuln_count", len(results.Vulnerabilities))
+	return results, nil
 }

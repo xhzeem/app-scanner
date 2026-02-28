@@ -61,6 +61,9 @@ type ScanOptions struct {
 	FingerprintProbes  []string `json:"fingerprint_probes,omitempty"`  // Probe types: icmp, tcp, arp, smb
 	FingerprintTimeout string   `json:"fingerprint_timeout,omitempty"` // Per-probe timeout (e.g., "3s")
 	DisableICMP        bool     `json:"disable_icmp,omitempty"`        // Disable ICMP for unprivileged mode
+
+	// Nuclei options
+	NucleiScan *NucleiScanConfig `json:"nuclei_scan,omitempty"`
 }
 
 // ScanMessage represents the incoming scan request message
@@ -138,7 +141,8 @@ func NewScanManager(kvStore store.KVStore, toolFactory *ScanToolFactory, updater
 		apiHTTPClient:   &http.Client{Timeout: apiRequestTimeout},
 		logger:          NewLoggingClient(),
 		scanStrategies: map[string]ScanStrategy{
-			"nmap": &NmapStrategy{},
+			"nmap":   &NmapStrategy{},
+			"nuclei": &NucleiStrategy{},
 		},
 	}
 
@@ -292,19 +296,22 @@ func (sm *ScanManager) submitHostWithSource(host sirius.Host, toolName string) e
 	req.Header.Set("Content-Type", "application/json")
 	serviceKey := strings.TrimSpace(os.Getenv("SIRIUS_API_KEY"))
 	if serviceKey == "" {
-		return fmt.Errorf("SIRIUS_API_KEY is required for scanner API calls")
+		slog.Warn("SIRIUS_API_KEY is required for scanner API calls - continuing without submission")
+		return nil
 	}
 	req.Header.Set("X-API-Key", serviceKey)
 
 	resp, err := sm.apiHTTPClient.Do(req)
 	if err != nil {
-		return fmt.Errorf("failed to submit host data to %s: %w", url, err)
+		slog.Warn("failed to submit host data", "url", url, "error", err)
+		return nil
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		return fmt.Errorf("API returned status %d for %s: %s", resp.StatusCode, url, strings.TrimSpace(string(body)))
+		slog.Warn("API returned non-success status", "status", resp.StatusCode, "url", url, "body", strings.TrimSpace(string(body)))
+		return nil
 	}
 
 	slog.Debug("Successfully submitted host with source", "host_ip", host.IP, "source_name", source.Name, "source_version", source.Version)
@@ -380,6 +387,15 @@ func (sm *ScanManager) handleMessage(msg string) {
 		if err != nil {
 			slog.Error("Failed to get template", "template_id", scanMsg.Options.TemplateID, "error", err)
 			sm.logger.LogScanError(scanMsg.ID, "template_resolution", "template_not_found", "Failed to resolve template", err)
+
+			// Mark scan as failed in KV store
+			if updateErr := sm.scanUpdater.Update(context.Background(), func(scan *store.ScanResult) error {
+				scan.Status = "failed"
+				scan.EndTime = time.Now().Format(time.RFC3339)
+				return nil
+			}); updateErr != nil {
+				slog.Error("Failed to mark scan as failed", "error", updateErr)
+			}
 			return
 		}
 
@@ -656,6 +672,59 @@ func (sm *ScanManager) scanIP(ctx context.Context, ip string) {
 			slog.Error("Vulnerability scan failed", "ip", ip, "error", err)
 		} else {
 			slog.Debug("Vulnerability scan completed", "ip", ip)
+		}
+	}
+
+	// PHASE 3: Nuclei Scanning (Nuclei - template-based application security testing)
+	if config := sm.currentScanOptions.NucleiScan; config != nil && config.Enabled {
+		slog.Info("Phase 3: Nuclei scanning", "ip", ip)
+		startTime := time.Now()
+
+		nucleiStrategy := sm.toolFactory.CreateTool("nuclei")
+		results, err := nucleiStrategy.ExecuteWithContext(ctx, ip)
+		duration := time.Since(startTime)
+
+		if err != nil {
+			slog.Error("Nuclei scanning failed", "ip", ip, "error", err)
+			sm.logger.LogToolExecution(sm.currentScanID, ip, "nuclei", duration, false, map[string]interface{}{
+				"error": err.Error(),
+			})
+		} else {
+			slog.Info("Nuclei scanning complete", "ip", ip, "vuln_count", len(results.Vulnerabilities))
+
+			// Log tool execution success
+			sm.logger.LogToolExecution(sm.currentScanID, ip, "nuclei", duration, true, map[string]interface{}{
+				"vuln_count": len(results.Vulnerabilities),
+			})
+
+			if len(results.Vulnerabilities) > 0 {
+				// Submit vulnerabilities to API
+				if err := sm.submitHostWithSource(results, "nuclei"); err != nil {
+					slog.Warn("Failed to submit nuclei results via API", "ip", ip, "error", err)
+				}
+
+				// Update KV store with vulnerabilities
+				if err := sm.scanUpdater.Update(context.Background(), func(scan *store.ScanResult) error {
+					// Merge vulnerabilities into global scan result
+					for _, vuln := range results.Vulnerabilities {
+						// Check if vuln already exists to avoid duplicates
+						exists := false
+						for _, v := range scan.Vulnerabilities {
+							if v.VID == vuln.VID && v.IP == ip {
+								exists = true
+								break
+							}
+						}
+						if !exists {
+							vuln.IP = ip // Ensure IP is set on vulnerability
+							scan.Vulnerabilities = append(scan.Vulnerabilities, vuln)
+						}
+					}
+					return nil
+				}); err != nil {
+					slog.Error("Failed to update scan results in KV store", "scan_id", sm.currentScanID, "error", err)
+				}
+			}
 		}
 	}
 

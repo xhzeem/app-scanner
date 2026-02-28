@@ -25,22 +25,37 @@ type Template struct {
 // AgentScanConfig defines agent-based scan settings within a template
 type AgentScanConfig struct {
 	Enabled        bool     `json:"enabled"`
-	Mode           string   `json:"mode"`            // "comprehensive", "templates-only", "scripts-only"
-	AgentIDs       []string `json:"agent_ids"`        // empty = all connected agents
-	Timeout        int      `json:"timeout"`          // seconds, default 300
-	Concurrency    int      `json:"concurrency"`      // parallel templates, default 5
+	Mode           string   `json:"mode"`                      // "comprehensive", "templates-only", "scripts-only"
+	AgentIDs       []string `json:"agent_ids"`                 // empty = all connected agents
+	Timeout        int      `json:"timeout"`                   // seconds, default 300
+	Concurrency    int      `json:"concurrency"`               // parallel templates, default 5
 	TemplateFilter []string `json:"template_filter,omitempty"` // specific templates, empty = all
+}
+
+// NucleiScanConfig defines Nuclei scanner settings within a template
+type NucleiScanConfig struct {
+	Enabled          bool     `json:"enabled"`
+	Templates        []string `json:"templates,omitempty"`
+	Tags             []string `json:"tags,omitempty"`
+	Severities       []string `json:"severities,omitempty"`
+	RateLimit        int      `json:"rate_limit,omitempty"`
+	Concurrency      int      `json:"concurrency,omitempty"`
+	BulkSize         int      `json:"bulk_size,omitempty"`
+	InteractshServer string   `json:"interactsh_server,omitempty"`
+	Fuzzing          bool     `json:"fuzzing,omitempty"`
+	FollowRedirects  bool     `json:"follow_redirects,omitempty"`
 }
 
 // TemplateOptions defines the scan configuration for a template
 type TemplateOptions struct {
-	ScanTypes    []string         `json:"scan_types"`
-	PortRange    string           `json:"port_range"`
-	Aggressive   bool             `json:"aggressive"`
-	MaxRetries   int              `json:"max_retries"`
-	Parallel     bool             `json:"parallel"`
-	ExcludePorts []string         `json:"exclude_ports,omitempty"`
-	AgentScan    *AgentScanConfig `json:"agent_scan,omitempty"`
+	ScanTypes    []string          `json:"scan_types"`
+	PortRange    string            `json:"port_range"`
+	Aggressive   bool              `json:"aggressive"`
+	MaxRetries   int               `json:"max_retries"`
+	Parallel     bool              `json:"parallel"`
+	ExcludePorts []string          `json:"exclude_ports,omitempty"`
+	AgentScan    *AgentScanConfig  `json:"agent_scan,omitempty"`
+	NucleiScan   *NucleiScanConfig `json:"nuclei_scan,omitempty"`
 }
 
 // TemplateList represents a list of template IDs
@@ -54,6 +69,3 @@ const (
 	TemplateListKey        = "scan:template:list"
 	SystemTemplatesListKey = "scan:system-templates"
 )
-
-
-

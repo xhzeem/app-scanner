@@ -45,6 +45,29 @@ func (f *ScanToolFactory) CreateTool(toolType string) ScanStrategy {
 		}
 
 		return nmapStrategy
+	case "nuclei":
+		// Create NucleiStrategy with options from the template/request
+		nConfig := f.currentOptions.NucleiScan
+		if nConfig == nil {
+			// Fallback to defaults if no config provided
+			return &NucleiStrategy{
+				Tags:       []string{"cve", "misconfig", "exposure"},
+				Severities: []string{"low", "medium", "high", "critical"},
+				RateLimit:  150,
+			}
+		}
+
+		return &NucleiStrategy{
+			Templates:        nConfig.Templates,
+			Tags:             nConfig.Tags,
+			Severities:       nConfig.Severities,
+			RateLimit:        nConfig.RateLimit,
+			Concurrency:      nConfig.Concurrency,
+			BulkSize:         nConfig.BulkSize,
+			InteractshServer: nConfig.InteractshServer,
+			Fuzzing:          nConfig.Fuzzing,
+			FollowRedirects:  nConfig.FollowRedirects,
+		}
 	case "fingerprint":
 		// Fingerprint strategy is handled differently since it has a separate interface.
 		// The manager uses CreateFingerprintTool() for this scan type.
